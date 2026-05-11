@@ -7,6 +7,35 @@ from scipy.optimize import brentq
 
 st.set_page_config(page_title="BESS Arbitrage Dashboard", layout="wide", page_icon="⚡")
 
+# ── Loan helper ───────────────────────────────────────────────────────────────
+def calc_loan_cashflows(investment, loan_pct, loan_rate, loan_years):
+    """Returns (equity_outflow, annual_pmt, schedule_dict)"""
+    financed  = investment * loan_pct
+    equity    = investment * (1 - loan_pct)
+    if loan_pct == 0 or loan_rate == 0:
+        return equity, 0.0, {}
+    r = loan_rate
+    pmt = financed * r / (1 - (1 + r) ** (-loan_years))
+    schedule = {}
+    balance = financed
+    for y in range(1, loan_years + 1):
+        interest  = balance * r
+        principal = pmt - interest
+        balance  -= principal
+        schedule[y] = {"pmt": pmt, "interest": interest, "principal": principal}
+    return equity, pmt, schedule
+
+def apply_loan_to_cf(df_net_col, investment, loan_pct, loan_rate, loan_years):
+    """Overlay loan repayment onto operating net-CF list → return adjusted cum-CF series."""
+    equity, pmt, schedule = calc_loan_cashflows(investment, loan_pct, loan_rate, loan_years)
+    cum = -equity
+    cum_series = []
+    for i, net_op in enumerate(df_net_col, start=1):
+        debt_service = schedule[i]["pmt"] if i in schedule else 0.0
+        cum += (net_op - debt_service)
+        cum_series.append(cum)
+    return cum_series, equity, pmt
+
 # ── Solar+BESS calculation engine ─────────────────────────────────────────────
 def calc_solar_bess(
     solar_kwp, solar_capex_per_mw, solar_cuf, solar_deg_pct,
@@ -19,6 +48,7 @@ def calc_solar_bess(
     cit, wacc,
     boi_scheme,              # "A" = 3Y/50% cap | "B" = 8Y/100% cap
     realization_factor,
+    solar_charge_ratio=1.0,  # 0–1 : สัดส่วน BESS ที่ชาร์จจาก Solar (ฟรี) vs Grid
 ):
     solar_mw  = solar_kwp / 1000
     bess_mwh  = bess_kwh  / 1000
@@ -57,12 +87,14 @@ def calc_solar_bess(
         solar_kwh_y  = solar_kwh_y1 * sol_deg
         solar_save   = solar_kwh_y  * avg * realization_factor
 
-        # BESS ชาร์จฟรีจาก Solar → ต้นทุนพลังงาน 0 → margin = ราคา on-peak เต็ม
-        # แต่ BESS ยังคง arbitrage spread เหมือนเดิม (discharge on-peak, charge off-peak)
-        # solar ชาร์จแทน off-peak → effective margin = on-peak rate (ไม่หัก off-peak)
-        # ใช้ realization factor เดียวกัน
+        # BESS effective margin ขึ้นกับ solar_charge_ratio:
+        #   ส่วน Solar (ฟรี) → margin = on-peak (ไม่หัก charging cost)
+        #   ส่วน Grid (off-peak) → margin = on-peak − off-peak/RTE (spread ปกติ)
         bess_kwh_y   = (bess_kwh * rte * cycles_day * days_year * bess_deg)
-        bess_arb     = bess_kwh_y  * (pk - op) * realization_factor
+        margin_solar = pk                        # ชาร์จฟรี → เก็บ on-peak เต็ม
+        margin_grid  = pk - (op / rte)           # ชาร์จ off-peak → spread
+        eff_margin   = solar_charge_ratio * margin_solar + (1 - solar_charge_ratio) * margin_grid
+        bess_arb     = bess_kwh_y * eff_margin * realization_factor
 
         demand_save  = demand_cut_kw * demand_rate_per_kw_mo * 12
 
@@ -397,6 +429,18 @@ m  = result["metrics"]
 # ── Bill Sidebar (collapsible) ────────────────────────────────────────────────
 with st.sidebar:
     st.divider()
+
+    # ── Loan / Financing ──
+    st.subheader("🏦 Financing (กู้เงิน)")
+    use_loan = st.toggle("เปิดใช้ Loan Model", value=False)
+    if use_loan:
+        loan_pct   = st.slider("% กู้ (ของ Investment)", 0, 90, 70) / 100
+        loan_rate  = st.slider("ดอกเบี้ย (%/ปี)", 1.0, 12.0, 4.5, 0.25) / 100
+        loan_years = st.number_input("ระยะกู้ (ปี)", min_value=1, max_value=20, value=7)
+    else:
+        loan_pct, loan_rate, loan_years = 0.0, 0.0, 0
+
+    st.divider()
     with st.expander("📄 กรอก Bill ลูกค้า (รายเดือน)", expanded=False):
         bill_data = {"Month": MONTHS, "Days": [], "On-Peak kWh": [], "Off-Peak kWh": [], "Holiday kWh": [], "kW Peak": []}
         for i, mo in enumerate(MONTHS):
@@ -473,6 +517,16 @@ with tab1:
                 marker=dict(color="gold", size=12, symbol="star"),
                 text=[f"Payback Y{pb}"], textposition="top center",
                 showlegend=False
+            ))
+        # Loan overlay
+        if use_loan:
+            net_col_vals = list(df[net_col])
+            loan_cum, loan_equity, loan_pmt_val = apply_loan_to_cf(
+                net_col_vals, result["customer_price"], loan_pct, loan_rate, int(loan_years))
+            fig_cum.add_trace(go.Scatter(
+                x=[0]+list(df["Year"]), y=[-loan_equity]+loan_cum,
+                mode="lines", name=f"กู้ {loan_pct*100:.0f}% @ {loan_rate*100:.2f}%",
+                line=dict(color="#ffd166", width=2, dash="dot"),
             ))
         fig_cum.update_layout(
             xaxis_title="ปี", yaxis_title="THB",
@@ -685,10 +739,32 @@ with tab5:
 
     with col_r:
         st.markdown("**🏛️ BOI & ปัจจัยอื่น**")
-        sb_boi_scheme = st.radio("BOI Scheme (BESS only)", ["A (3Y/50%)", "B (8Y/100%)"])
-        sb_real_factor= st.slider("Realization Factor (%)", 50, 100, 70, 5) / 100
-        sb_om_pct     = st.slider("OM % of Total CAPEX (Y11+)", 0.3, 2.0, 0.5, 0.1, key="sb_om") / 100
-        sb_bundled_om = st.number_input("Bundled OM ปี", min_value=1, max_value=15, value=10, key="sb_bom")
+        sb_boi_scheme   = st.radio("BOI Scheme (BESS only)", ["A (3Y/50%)", "B (8Y/100%)"])
+        sb_real_factor  = st.slider("Realization Factor (%)", 50, 100, 70, 5) / 100
+        sb_om_pct       = st.slider("OM % of Total CAPEX (Y11+)", 0.3, 2.0, 0.5, 0.1, key="sb_om") / 100
+        sb_bundled_om   = st.number_input("Bundled OM ปี", min_value=1, max_value=15, value=10, key="sb_bom")
+
+    st.divider()
+    col_ratio, col_loan = st.columns(2)
+    with col_ratio:
+        st.markdown("**☀️ Solar:Grid Operation Ratio**")
+        st.caption("% ของพลังงานที่ BESS ชาร์จมาจาก Solar (ฟรี) vs ดึงจาก Grid (เสียค่า off-peak)")
+        solar_charge_ratio = st.slider("BESS ชาร์จจาก Solar (%)", 0, 100, 100, 5, key="sb_scr") / 100
+        grid_charge_ratio  = 1 - solar_charge_ratio
+        sc1, sc2 = st.columns(2)
+        sc1.metric("จาก Solar", f"{solar_charge_ratio*100:.0f}%")
+        sc2.metric("จาก Grid (off-peak)", f"{grid_charge_ratio*100:.0f}%")
+
+    with col_loan:
+        st.markdown("**🏦 Financing (กู้เงิน)**")
+        st.caption("ถ้าไม่กู้ → ใช้ค่าจาก Sidebar / ถ้าจะตั้งใหม่เฉพาะ Solar+BESS ก็ปรับได้ที่นี่")
+        sb_use_loan  = st.toggle("เปิด Loan สำหรับ Solar+BESS", value=use_loan, key="sb_loan")
+        if sb_use_loan:
+            sb_loan_pct   = st.slider("% กู้", 0, 90, int(loan_pct*100) if use_loan else 70, key="sb_lp") / 100
+            sb_loan_rate  = st.slider("ดอกเบี้ย (%/ปี)", 1.0, 12.0, loan_rate*100 if use_loan else 4.5, 0.25, key="sb_lr") / 100
+            sb_loan_years = st.number_input("ระยะกู้ (ปี)", 1, 20, int(loan_years) if use_loan else 7, key="sb_ly")
+        else:
+            sb_loan_pct, sb_loan_rate, sb_loan_years = 0.0, 0.0, 0
 
     st.divider()
 
@@ -715,17 +791,40 @@ with tab5:
         wacc               = wacc,
         boi_scheme         = sb_boi_scheme,
         realization_factor = sb_real_factor,
+        solar_charge_ratio = solar_charge_ratio,
     )
+
+    # Loan overlay for Solar+BESS
+    if sb_use_loan:
+        sb_loan_cum, sb_loan_equity, sb_loan_pmt_val = apply_loan_to_cf(
+            list(sb_df["Net CF (THB)"]), sb_m["total_investment"],
+            sb_loan_pct, sb_loan_rate, int(sb_loan_years))
+        sb_loan_irr15 = safe_irr([-sb_loan_equity] + [a-b for a,b in zip(
+            list(sb_df["Net CF (THB)"][:15]),
+            [sb_loan_pmt_val if i < sb_loan_years else 0 for i in range(15)])])
+        sb_loan_irr30 = safe_irr([-sb_loan_equity] + [a-b for a,b in zip(
+            list(sb_df["Net CF (THB)"]),
+            [sb_loan_pmt_val if i < sb_loan_years else 0 for i in range(30)])])
 
     # ── KPI Cards ──
     st.subheader("📌 Key Metrics — Solar+BESS Bundle")
     k1, k2, k3, k4, k5 = st.columns(5)
     pb_sol = sb_m["payback"]
-    k1.metric("Payback", f"ปีที่ {pb_sol:.1f}" if pb_sol else ">30Y")
-    k2.metric("IRR 15Y", f"{sb_m['irr_15']*100:.1f}%" if sb_m["irr_15"] else "N/A")
-    k3.metric("IRR 30Y", f"{sb_m['irr_30']*100:.1f}%" if sb_m["irr_30"] else "N/A")
+    k1.metric("Payback (ไม่กู้)", f"ปีที่ {pb_sol:.1f}" if pb_sol else ">30Y")
+    k2.metric("IRR 15Y (ไม่กู้)", f"{sb_m['irr_15']*100:.1f}%" if sb_m["irr_15"] else "N/A")
+    k3.metric("IRR 30Y (ไม่กู้)", f"{sb_m['irr_30']*100:.1f}%" if sb_m["irr_30"] else "N/A")
     k4.metric("NPV 30Y", fmt_thb(sb_m["npv_30"]))
     k5.metric("Cum CF 30Y", fmt_thb(sb_m["cum_30"]))
+
+    if sb_use_loan:
+        st.markdown(f"**🏦 กู้ {sb_loan_pct*100:.0f}% — ดอกเบี้ย {sb_loan_rate*100:.2f}%/ปี — {sb_loan_years} ปี**")
+        lk1, lk2, lk3, lk4, lk5 = st.columns(5)
+        lk1.metric("Equity ที่ใช้ (Y0)", fmt_thb(sb_loan_equity))
+        lk2.metric("Annual PMT", fmt_thb(sb_loan_pmt_val))
+        lk3.metric("IRR 15Y (กู้)", f"{sb_loan_irr15*100:.1f}%" if sb_loan_irr15 else "N/A")
+        lk4.metric("IRR 30Y (กู้)", f"{sb_loan_irr30*100:.1f}%" if sb_loan_irr30 else "N/A")
+        lb_payback = next((i+1 for i, v in enumerate(sb_loan_cum) if v >= 0), None)
+        lk5.metric("Payback (กู้)", f"ปีที่ {lb_payback}" if lb_payback else ">30Y")
 
     k6, k7, k8, k9 = st.columns(4)
     k6.metric("Total Investment", fmt_thb(sb_m["total_investment"]))
@@ -764,13 +863,18 @@ with tab5:
         fill="tozeroy", fillcolor="rgba(255,209,102,0.1)"
     ))
     if pb_sol:
-        pb_y = int(pb_sol)
-        pb_val = float(sb_df[sb_df["Year"]==pb_y]["Cum CF (THB)"].values[0]) if pb_y <= 30 else 0
         cum_fig_sol.add_trace(go.Scatter(
             x=[pb_sol], y=[0], mode="markers+text",
             marker=dict(color="gold", size=13, symbol="star"),
             text=[f"Payback Y{pb_sol:.1f}"], textposition="top center",
             showlegend=False
+        ))
+    if sb_use_loan:
+        cum_fig_sol.add_trace(go.Scatter(
+            x=[0]+list(sb_df["Year"]),
+            y=[-sb_loan_equity]+sb_loan_cum,
+            mode="lines", name=f"กู้ {sb_loan_pct*100:.0f}% @ {sb_loan_rate*100:.2f}%",
+            line=dict(color="#ef476f", width=2, dash="dot")
         ))
     cum_fig_sol.update_layout(title="Cumulative Cash Flow 30Y", xaxis_title="ปี", yaxis_title="THB",
                                height=320, margin=dict(l=10,r=10,t=40,b=30))

@@ -235,6 +235,15 @@ def calc_model(p, ass, units):
     net_capex = customer_price - boi_duty_saving
     boi_cap = net_capex * ass["boi_cap_x"]
 
+    # ── แยก charge / discharge efficiency ──────────────────────────────────────
+    eta_c   = ass["charge_eff"]        # ηc: Grid → Battery
+    eta_d   = ass["discharge_eff"]     # ηd: Battery → Load
+    rte     = eta_c * eta_d            # RTE = ηc × ηd (auto)
+    aux_kw  = ass["aux_kw"]            # Parasitic load (BMS, cooling) kW
+
+    # ── TOU Calendar (วันจันทร์–ศุกร์ ลบวันหยุดนักขัตฤกษ์) ────────────────────
+    working_days = ass["working_days"]  # วันที่ BESS arbitrage ได้จริง
+
     years = list(range(1, 31))
     rows = []
     cum_nb = cum_epc = cum_ppa = -customer_price
@@ -244,15 +253,27 @@ def calc_model(p, ass, units):
         deg = p["deg"][y-1]
         on_peak  = ass["on_peak_y1"]  * (1 + ass["tou_esc"]) ** (y-1)
         off_peak = ass["off_peak_y1"] * (1 + ass["tou_esc"]) ** (y-1)
-        arb_margin = on_peak - (off_peak / ass["rte"])
-        energy_out = cap_kwh * ass["rte"] * ass["cycles_day"] * ass["days_year"] * deg
+
+        # Energy flow (per cycle per working day):
+        #   E_in  = cap_kwh / ηc          ← ดึงจาก Grid off-peak
+        #   E_out = cap_kwh × ηd × deg    ← จ่ายให้ load on-peak (ลด degradation)
+        # Arb margin ต่อ kWh ที่จ่ายออก:
+        #   Revenue/kWh = on_peak
+        #   Cost/kWh    = off_peak / (ηc × ηd) = off_peak / rte  [เพราะต้องชาร์จ 1/ηc และได้ออก ηd]
+        #   → margin = on_peak − off_peak / rte  (เหมือนเดิม แต่ rte = ηc×ηd แทน)
+        arb_margin = on_peak - (off_peak / rte)
+
+        energy_out = cap_kwh * eta_d * ass["cycles_day"] * working_days * deg
         gross_saving = energy_out * arb_margin
-        om_cost = 0.0 if y <= ass["bundled_om_years"] else annual_om
+
+        # Aux load cost: ทำงานตลอด 8760 ชม. ที่ off-peak rate (เป็น load ตลอด 24 ชม.)
+        aux_cost = aux_kw * 8760 * off_peak / 1000  # kW × hr × THB/kWh (แปลง kW → kWh)
+
+        om_cost = (0.0 if y <= ass["bundled_om_years"] else annual_om) + aux_cost
         pre_tax = gross_saving - om_cost
 
         tax_nb = max(0.0, pre_tax * ass["cit"])
 
-        # EPC: exempt until cap exhausted
         if cum_exempt_epc < boi_cap and y <= ass["boi_epc_y"]:
             exempt_epc = min(pre_tax * ass["cit"], boi_cap - cum_exempt_epc)
             cum_exempt_epc += exempt_epc
@@ -274,13 +295,26 @@ def calc_model(p, ass, units):
         cum_epc += net_epc
         cum_ppa += net_ppa
 
+        # Energy waterfall values (Y1 reference)
+        e_in_grid   = cap_kwh / eta_c * ass["cycles_day"] * working_days * deg
+        e_chg_loss  = e_in_grid - (cap_kwh * ass["cycles_day"] * working_days * deg)
+        e_stored    = cap_kwh * ass["cycles_day"] * working_days * deg
+        e_dchg_loss = e_stored - energy_out
+
         rows.append({
             "Year": y, "Degradation": deg,
+            "Working Days": working_days,
+            "E In from Grid (kWh)": e_in_grid,
+            "Charging Loss (kWh)": e_chg_loss,
+            "E Stored (kWh)": e_stored,
+            "Discharging Loss (kWh)": e_dchg_loss,
             "Energy Out (kWh)": energy_out,
+            "RTE (ηc×ηd)": rte,
             "On-Peak (THB/kWh)": on_peak,
             "Off-Peak (THB/kWh)": off_peak,
             "Arb Margin (THB/kWh)": arb_margin,
             "Gross Saving": gross_saving,
+            "Aux Cost": aux_cost,
             "OM Cost": om_cost,
             "Pre-Tax CF": pre_tax,
             "Tax Non-BOI": tax_nb,
@@ -378,10 +412,25 @@ with st.sidebar:
     # ── Operating ──
     st.subheader("⚙️ Operating Parameters")
     cycles_day  = st.slider("Cycles/Day", 0.5, 3.0, 1.0, 0.25)
-    rte         = st.slider("Round-Trip Efficiency (%)", 75, 97, 88) / 100
-    days_year   = st.number_input("วันต่อปี", min_value=200, max_value=365, value=365)
     om_pct      = st.slider("OM % of CAPEX/ปี (Y11+)", 0.5, 3.0, 1.5, 0.1) / 100
     bundled_om_years = st.number_input("Bundled OM ปี (รวมในราคา)", min_value=1, max_value=15, value=10)
+
+    st.markdown("**🗓️ TOU Calendar — วันที่ Arbitrage ได้จริง**")
+    st.caption("ไทย: จันทร์–ศุกร์ 09:00–22:00 เท่านั้น เสาร์/อาทิตย์/หยุดนักขัตฤกษ์ = Off-Peak ทั้งวัน")
+    weekdays_yr   = st.number_input("วันจันทร์–ศุกร์/ปี", min_value=240, max_value=262, value=261)
+    pub_holidays  = st.number_input("วันหยุดนักขัตฤกษ์/ปี (ตกวันทำการ)", min_value=0, max_value=20, value=13)
+    working_days  = int(weekdays_yr - pub_holidays)
+    st.info(f"วันที่ Arbitrage ได้จริง: **{working_days} วัน/ปี** (vs 365 วัน = overestimate {365-working_days} วัน)")
+
+    st.markdown("**⚡ Energy Loss (แยก Charge / Discharge)**")
+    charge_eff    = st.slider("Charging Efficiency ηc (%)", 90, 99, 97, 1) / 100
+    discharge_eff = st.slider("Discharging Efficiency ηd (%)", 90, 99, 97, 1) / 100
+    rte_calc      = charge_eff * discharge_eff
+    aux_kw        = st.number_input("Aux Load — BMS/Cooling (kW)", min_value=0.0, max_value=50.0, value=5.0, step=0.5)
+    st.info(f"RTE = ηc × ηd = {charge_eff*100:.0f}% × {discharge_eff*100:.0f}% = **{rte_calc*100:.1f}%** | Aux: {aux_kw} kW × 8,760 ชม./ปี")
+    # Keep rte variable for Solar+BESS compatibility
+    rte = rte_calc
+    days_year = 365  # ใช้ใน Solar+BESS เท่านั้น
 
     st.divider()
 
@@ -413,6 +462,8 @@ p_override["dealer_usd_kwh"] = dealer_usd
 ass = {
     "on_peak_y1": on_peak_y1, "off_peak_y1": off_peak_y1, "tou_esc": tou_esc,
     "cycles_day": cycles_day, "rte": rte, "days_year": days_year,
+    "charge_eff": charge_eff, "discharge_eff": discharge_eff, "aux_kw": aux_kw,
+    "working_days": working_days,
     "om_pct": om_pct, "bundled_om_years": bundled_om_years,
     "cit": cit, "wacc": wacc,
     "boi_epc_y": boi_epc_y, "boi_ppa_y": boi_ppa_y,
@@ -597,8 +648,46 @@ with tab2:
     net_col2 = {"NB":"Net CF Non-BOI","EPC":"Net CF EPC","PPA":"Net CF PPA"}[sk2]
     cum_col2 = {"NB":"Cum CF Non-BOI","EPC":"Cum CF EPC","PPA":"Cum CF PPA"}[sk2]
 
-    display_cols = ["Year","Energy Out (kWh)","On-Peak (THB/kWh)","Off-Peak (THB/kWh)",
-                    "Arb Margin (THB/kWh)","Gross Saving","OM Cost","Pre-Tax CF",net_col2,cum_col2]
+    # ── Energy Loss Waterfall (Y1) ──────────────────────────────────────────────
+    y1r = df.iloc[0]
+    st.subheader("⚡ Energy Flow — Y1 (Waterfall)")
+    wf_labels = ["Grid Input","Charging Loss","Stored in Battery","Discharging Loss","Delivered to Load"]
+    wf_values = [
+        y1r["E In from Grid (kWh)"],
+        -y1r["Charging Loss (kWh)"],
+        y1r["E Stored (kWh)"],
+        -y1r["Discharging Loss (kWh)"],
+        y1r["Energy Out (kWh)"],
+    ]
+    wf_measure = ["absolute","relative","absolute","relative","absolute"]
+    wf_fig = go.Figure(go.Waterfall(
+        orientation="v", measure=wf_measure,
+        x=wf_labels, y=wf_values,
+        connector=dict(line=dict(color="gray", width=1, dash="dot")),
+        increasing=dict(marker_color="#06d6a0"),
+        decreasing=dict(marker_color="#ef476f"),
+        totals=dict(marker_color="#00b4d8"),
+        text=[f"{abs(v):,.0f} kWh" for v in wf_values],
+        textposition="outside",
+    ))
+    wf_fig.update_layout(
+        title=f"Energy Flow per ปี (working_days={int(y1r['Working Days'])}วัน, ηc={charge_eff*100:.0f}%, ηd={discharge_eff*100:.0f}%, RTE={rte*100:.1f}%)",
+        yaxis_title="kWh/ปี", height=380, margin=dict(l=10,r=10,t=50,b=10)
+    )
+    st.plotly_chart(wf_fig, use_container_width=True)
+
+    wf_cols = st.columns(5)
+    wf_cols[0].metric("Grid Input (kWh/ปี)",    f"{y1r['E In from Grid (kWh)']:,.0f}")
+    wf_cols[1].metric("Charging Loss",           f"{y1r['Charging Loss (kWh)']:,.0f} kWh ({(1-charge_eff)*100:.1f}%)")
+    wf_cols[2].metric("Stored",                  f"{y1r['E Stored (kWh)']:,.0f} kWh")
+    wf_cols[3].metric("Discharging Loss",         f"{y1r['Discharging Loss (kWh)']:,.0f} kWh ({(1-discharge_eff)*100:.1f}%)")
+    wf_cols[4].metric("Delivered to Load (kWh/ปี)", f"{y1r['Energy Out (kWh)']:,.0f}")
+    st.caption(f"Aux Load: {aux_kw} kW × 8,760 ชม. = {aux_kw*8760:,.0f} kWh/ปี → ค่าใช้จ่ายเพิ่ม {fmt_thb(y1r['Aux Cost'])}/ปี")
+    st.divider()
+
+    display_cols = ["Year","E In from Grid (kWh)","Charging Loss (kWh)","Energy Out (kWh)",
+                    "On-Peak (THB/kWh)","Off-Peak (THB/kWh)",
+                    "Arb Margin (THB/kWh)","Gross Saving","Aux Cost","OM Cost","Pre-Tax CF",net_col2,cum_col2]
     df_display = df[display_cols].copy()
 
     # Format numbers

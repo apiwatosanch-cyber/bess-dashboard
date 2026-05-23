@@ -750,11 +750,18 @@ with tab2:
     display_cols = [c for c in base_cols if c in df.columns]
     df_display = df[display_cols].copy()
 
-    # Format numbers
-    for col in ["Energy Out (kWh)","Gross Saving","OM Cost","Pre-Tax CF",net_col2,cum_col2]:
-        df_display[col] = df_display[col].map(lambda x: f"{x:,.0f}")
-    for col in ["On-Peak (THB/kWh)","Off-Peak (THB/kWh)","Arb Margin (THB/kWh)"]:
-        df_display[col] = df_display[col].map(lambda x: f"{x:.4f}")
+    # Format numbers — only format columns that actually exist in display_cols
+    fmt_int_cols = ["C1 Solar Energy Out (kWh)","C1 Solar Revenue (THB)",
+                    "C2 Grid Energy Out (kWh)","C2 Arb Revenue (THB)",
+                    "E In from Grid (kWh)","Charging Loss (kWh)","Energy Out (kWh)",
+                    "Gross Saving","Aux Cost","OM Cost","Pre-Tax CF",net_col2,cum_col2]
+    fmt_dec_cols = ["On-Peak (THB/kWh)","Off-Peak (THB/kWh)","Arb Margin C2 (THB/kWh)"]
+    for col in fmt_int_cols:
+        if col in df_display.columns:
+            df_display[col] = df_display[col].map(lambda x: f"{x:,.0f}")
+    for col in fmt_dec_cols:
+        if col in df_display.columns:
+            df_display[col] = df_display[col].map(lambda x: f"{x:.4f}")
 
     df_display["Year"] = df_display["Year"].map(lambda x: f"Y{x}")
     st.dataframe(df_display.set_index("Year"), use_container_width=True, height=600)

@@ -279,23 +279,24 @@ def calc_model(p, ass, units):
         total_energy_out = c2_energy_out + c1_energy_out
         gross_saving     = c2_revenue + c1_revenue
 
-        # Aux load cost
-        aux_cost = aux_kw * 8760 * off_peak / 1000
+        # Aux load cost: kW × 8,760 h × THB/kWh = THB  (ไม่หาร 1000)
+        aux_cost = aux_kw * 8760 * off_peak
 
         om_cost = (0.0 if y <= ass["bundled_om_years"] else annual_om) + aux_cost
         pre_tax = gross_saving - om_cost
 
         tax_nb = max(0.0, pre_tax * ass["cit"])
 
+        # Bug fix: exempt ต้องไม่ติดลบ (กรณี pre_tax < 0)
         if cum_exempt_epc < boi_cap and y <= ass["boi_epc_y"]:
-            exempt_epc = min(pre_tax * ass["cit"], boi_cap - cum_exempt_epc)
+            exempt_epc = min(max(0.0, pre_tax * ass["cit"]), boi_cap - cum_exempt_epc)
             cum_exempt_epc += exempt_epc
             tax_epc = max(0.0, pre_tax * ass["cit"] - exempt_epc)
         else:
             tax_epc = tax_nb
 
         if cum_exempt_ppa < boi_cap and y <= ass["boi_ppa_y"]:
-            exempt_ppa = min(pre_tax * ass["cit"], boi_cap - cum_exempt_ppa)
+            exempt_ppa = min(max(0.0, pre_tax * ass["cit"]), boi_cap - cum_exempt_ppa)
             cum_exempt_ppa += exempt_ppa
             tax_ppa = max(0.0, pre_tax * ass["cit"] - exempt_ppa)
         else:

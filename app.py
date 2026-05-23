@@ -728,7 +728,7 @@ with tab2:
         textposition="outside",
     ))
     wf_fig.update_layout(
-        title=f"Energy Flow per ปี (working_days={int(y1r['Working Days'])}วัน, ηc={charge_eff*100:.0f}%, ηd={discharge_eff*100:.0f}%, RTE={rte*100:.1f}%)",
+        title=f"Energy Flow per ปี (working_days={int(y1r['Working Days (Arb)'])}วัน, ηc={charge_eff*100:.0f}%, ηd={discharge_eff*100:.0f}%, RTE={rte*100:.1f}%)",
         yaxis_title="kWh/ปี", height=380, margin=dict(l=10,r=10,t=50,b=10)
     )
     st.plotly_chart(wf_fig, use_container_width=True)

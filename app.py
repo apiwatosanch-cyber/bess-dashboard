@@ -241,8 +241,13 @@ def calc_model(p, ass, units):
     rte     = eta_c * eta_d            # RTE = ηc × ηd (auto)
     aux_kw  = ass["aux_kw"]            # Parasitic load (BMS, cooling) kW
 
-    # ── TOU Calendar (วันจันทร์–ศุกร์ ลบวันหยุดนักขัตฤกษ์) ────────────────────
-    working_days = ass["working_days"]  # วันที่ BESS arbitrage ได้จริง
+    # ── TOU Calendar ────────────────────────────────────────────────────────────
+    working_days = ass["working_days"]   # วัน จ-ศ ลบวันหยุดนักขัตฤกษ์
+
+    # ── 2-Cycle Mode ────────────────────────────────────────────────────────────
+    dual_cycle    = ass.get("dual_cycle", False)
+    solar_days    = ass.get("solar_days", 310)       # วันที่มีแดดพอชาร์จ (Cycle 1)
+    solar_real    = ass.get("solar_realization", 0.8) # realization factor ของ Solar cycle
 
     years = list(range(1, 31))
     rows = []
@@ -254,20 +259,28 @@ def calc_model(p, ass, units):
         on_peak  = ass["on_peak_y1"]  * (1 + ass["tou_esc"]) ** (y-1)
         off_peak = ass["off_peak_y1"] * (1 + ass["tou_esc"]) ** (y-1)
 
-        # Energy flow (per cycle per working day):
-        #   E_in  = cap_kwh / ηc          ← ดึงจาก Grid off-peak
-        #   E_out = cap_kwh × ηd × deg    ← จ่ายให้ load on-peak (ลด degradation)
-        # Arb margin ต่อ kWh ที่จ่ายออก:
-        #   Revenue/kWh = on_peak
-        #   Cost/kWh    = off_peak / (ηc × ηd) = off_peak / rte  [เพราะต้องชาร์จ 1/ηc และได้ออก ηd]
-        #   → margin = on_peak − off_peak / rte  (เหมือนเดิม แต่ rte = ηc×ηd แทน)
-        arb_margin = on_peak - (off_peak / rte)
+        # ── Cycle 2: Grid Arb (จ-ศ เท่านั้น) ───────────────────────────────────
+        # ชาร์จ off-peak ราคาถูก → ปล่อยช่วงเช้า on-peak
+        # Margin = on_peak − off_peak/RTE  (spread ปกติ)
+        arb_margin   = on_peak - (off_peak / rte)
+        c2_energy_out = cap_kwh * eta_d * working_days * deg
+        c2_revenue    = c2_energy_out * arb_margin
 
-        energy_out = cap_kwh * eta_d * ass["cycles_day"] * working_days * deg
-        gross_saving = energy_out * arb_margin
+        # ── Cycle 1: Solar (วันที่มีแดด) ────────────────────────────────────────
+        # ชาร์จฟรีจาก Solar → ปล่อย 18:00-22:00 on-peak
+        # Margin = on_peak เต็ม (ไม่มีต้นทุนชาร์จ)
+        if dual_cycle:
+            c1_energy_out = cap_kwh * eta_d * solar_days * deg
+            c1_revenue    = c1_energy_out * on_peak * solar_real
+        else:
+            c1_energy_out = 0.0
+            c1_revenue    = 0.0
 
-        # Aux load cost: ทำงานตลอด 8760 ชม. ที่ off-peak rate (เป็น load ตลอด 24 ชม.)
-        aux_cost = aux_kw * 8760 * off_peak / 1000  # kW × hr × THB/kWh (แปลง kW → kWh)
+        total_energy_out = c2_energy_out + c1_energy_out
+        gross_saving     = c2_revenue + c1_revenue
+
+        # Aux load cost
+        aux_cost = aux_kw * 8760 * off_peak / 1000
 
         om_cost = (0.0 if y <= ass["bundled_om_years"] else annual_om) + aux_cost
         pre_tax = gross_saving - om_cost
@@ -295,24 +308,29 @@ def calc_model(p, ass, units):
         cum_epc += net_epc
         cum_ppa += net_ppa
 
-        # Energy waterfall values (Y1 reference)
-        e_in_grid   = cap_kwh / eta_c * ass["cycles_day"] * working_days * deg
-        e_chg_loss  = e_in_grid - (cap_kwh * ass["cycles_day"] * working_days * deg)
-        e_stored    = cap_kwh * ass["cycles_day"] * working_days * deg
-        e_dchg_loss = e_stored - energy_out
+        # Energy waterfall (Cycle 2 grid-side only)
+        e_in_grid   = cap_kwh / eta_c * working_days * deg
+        e_chg_loss  = e_in_grid - (cap_kwh * working_days * deg)
+        e_stored    = cap_kwh * working_days * deg
+        e_dchg_loss = e_stored - c2_energy_out
 
         rows.append({
             "Year": y, "Degradation": deg,
-            "Working Days": working_days,
+            "Working Days (Arb)": working_days,
+            "Solar Days (C1)": solar_days if dual_cycle else 0,
+            "C1 Solar Energy Out (kWh)": c1_energy_out,
+            "C1 Solar Revenue (THB)": c1_revenue,
+            "C2 Grid Energy Out (kWh)": c2_energy_out,
+            "C2 Arb Revenue (THB)": c2_revenue,
             "E In from Grid (kWh)": e_in_grid,
             "Charging Loss (kWh)": e_chg_loss,
             "E Stored (kWh)": e_stored,
             "Discharging Loss (kWh)": e_dchg_loss,
-            "Energy Out (kWh)": energy_out,
+            "Energy Out (kWh)": total_energy_out,
             "RTE (ηc×ηd)": rte,
             "On-Peak (THB/kWh)": on_peak,
             "Off-Peak (THB/kWh)": off_peak,
-            "Arb Margin (THB/kWh)": arb_margin,
+            "Arb Margin C2 (THB/kWh)": arb_margin,
             "Gross Saving": gross_saving,
             "Aux Cost": aux_cost,
             "OM Cost": om_cost,
@@ -428,9 +446,26 @@ with st.sidebar:
     rte_calc      = charge_eff * discharge_eff
     aux_kw        = st.number_input("Aux Load — BMS/Cooling (kW)", min_value=0.0, max_value=50.0, value=5.0, step=0.5)
     st.info(f"RTE = ηc × ηd = {charge_eff*100:.0f}% × {discharge_eff*100:.0f}% = **{rte_calc*100:.1f}%** | Aux: {aux_kw} kW × 8,760 ชม./ปี")
-    # Keep rte variable for Solar+BESS compatibility
     rte = rte_calc
-    days_year = 365  # ใช้ใน Solar+BESS เท่านั้น
+    days_year = 365
+
+    st.divider()
+    st.subheader("☀️ 2-Cycle Mode")
+    st.caption("Cycle 1: Solar → BESS → ปล่อย 18-22 น. (margin = on-peak เต็ม)\nCycle 2: Grid off-peak → BESS → ปล่อยเช้า (margin = spread)")
+    dual_cycle = st.toggle("เปิด 2-Cycle (Solar + Grid Arb)", value=False)
+    if dual_cycle:
+        solar_days        = st.number_input("วันที่มีแดดพอชาร์จ BESS/ปี", min_value=200, max_value=365, value=310)
+        solar_realization = st.slider("Realization Factor — Solar Cycle (%)", 50, 100, 80, 5) / 100
+        c1_kwh_est = p["unit_kwh"] * n_units * charge_eff * discharge_eff * solar_days
+        c2_kwh_est = p["unit_kwh"] * n_units * charge_eff * discharge_eff * working_days
+        st.info(
+            f"**C1 Solar**: {c1_kwh_est:,.0f} kWh/ปี × on-peak × {solar_realization*100:.0f}%\n\n"
+            f"**C2 Grid Arb**: {c2_kwh_est:,.0f} kWh/ปี × spread\n\n"
+            f"รวม {solar_days + working_days} cycle-days/ปี (ถ้า BESS ทำได้ 2 รอบ/วัน)"
+        )
+    else:
+        solar_days        = 310
+        solar_realization = 0.8
 
     st.divider()
 
@@ -464,6 +499,7 @@ ass = {
     "cycles_day": cycles_day, "rte": rte, "days_year": days_year,
     "charge_eff": charge_eff, "discharge_eff": discharge_eff, "aux_kw": aux_kw,
     "working_days": working_days,
+    "dual_cycle": dual_cycle, "solar_days": solar_days, "solar_realization": solar_realization,
     "om_pct": om_pct, "bundled_om_years": bundled_om_years,
     "cit": cit, "wacc": wacc,
     "boi_epc_y": boi_epc_y, "boi_ppa_y": boi_ppa_y,
@@ -600,6 +636,27 @@ with tab1:
         )
         st.plotly_chart(fig_bar, use_container_width=True)
 
+    # 2-Cycle Revenue breakdown
+    if dual_cycle:
+        st.subheader("☀️ 2-Cycle Revenue Breakdown")
+        y1r = df.iloc[0]
+        dc1, dc2, dc3 = st.columns(3)
+        dc1.metric("C1 Solar Revenue Y1", fmt_thb(y1r["C1 Solar Revenue (THB)"]),
+                   help=f"Solar {solar_days}วัน × on-peak เต็ม × {solar_realization*100:.0f}% realization")
+        dc2.metric("C2 Grid Arb Revenue Y1", fmt_thb(y1r["C2 Arb Revenue (THB)"]),
+                   help=f"Grid Arb {working_days}วัน × spread (on-peak − off-peak/RTE)")
+        dc3.metric("รวม Gross Saving Y1", fmt_thb(y1r["Gross Saving"]))
+
+        fig_dc = go.Figure()
+        fig_dc.add_trace(go.Bar(x=df["Year"], y=df["C1 Solar Revenue (THB)"],
+                                name="☀️ C1 Solar (free charge)", marker_color="#ffd166"))
+        fig_dc.add_trace(go.Bar(x=df["Year"], y=df["C2 Arb Revenue (THB)"],
+                                name="⚡ C2 Grid Arb (spread)", marker_color="#00b4d8"))
+        fig_dc.update_layout(barmode="stack", xaxis_title="ปี", yaxis_title="THB",
+                             height=300, margin=dict(l=10,r=10,t=10,b=30))
+        st.plotly_chart(fig_dc, use_container_width=True)
+        st.divider()
+
     # BOI scenario comparison
     st.subheader("🏛️ เปรียบเทียบ 3 BOI Scenarios")
     boi_rows = []
@@ -685,9 +742,12 @@ with tab2:
     st.caption(f"Aux Load: {aux_kw} kW × 8,760 ชม. = {aux_kw*8760:,.0f} kWh/ปี → ค่าใช้จ่ายเพิ่ม {fmt_thb(y1r['Aux Cost'])}/ปี")
     st.divider()
 
-    display_cols = ["Year","E In from Grid (kWh)","Charging Loss (kWh)","Energy Out (kWh)",
-                    "On-Peak (THB/kWh)","Off-Peak (THB/kWh)",
-                    "Arb Margin (THB/kWh)","Gross Saving","Aux Cost","OM Cost","Pre-Tax CF",net_col2,cum_col2]
+    base_cols = ["Year","C1 Solar Energy Out (kWh)","C1 Solar Revenue (THB)",
+                 "C2 Grid Energy Out (kWh)","C2 Arb Revenue (THB)",
+                 "E In from Grid (kWh)","Charging Loss (kWh)","Energy Out (kWh)",
+                 "On-Peak (THB/kWh)","Off-Peak (THB/kWh)",
+                 "Arb Margin C2 (THB/kWh)","Gross Saving","Aux Cost","OM Cost","Pre-Tax CF",net_col2,cum_col2]
+    display_cols = [c for c in base_cols if c in df.columns]
     df_display = df[display_cols].copy()
 
     # Format numbers

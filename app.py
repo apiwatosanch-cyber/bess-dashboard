@@ -46,7 +46,7 @@ def calc_solar_bess(
     rte, cycles_day, days_year,
     om_pct, bundled_om_years,
     cit, wacc,
-    boi_scheme,              # "A" = 3Y/50% cap | "B" = 8Y/100% cap
+    use_boi,                 # True = ใช้ BOI ๓/๒๕๖๘ (ต้องมี Solar)
     realization_factor,
     solar_charge_ratio=1.0,  # 0–1 : สัดส่วน BESS ที่ชาร์จจาก Solar (ฟรี) vs Grid
 ):
@@ -61,14 +61,17 @@ def calc_solar_bess(
     bundled_om_total = annual_om * bundled_om_years
     total_investment = total_capex + bundled_om_total
 
-    # BOI — BESS only (Solar ไม่ได้ BOI ตั้งแต่ ก.ค. 2568)
-    bess_eligible_per_mwh = 12_000_000   # ≤ 12M THB per MW (ตาม BOI)
-    bess_eligible = min(bess_capex, bess_eligible_per_mwh * bess_mwh)
-    if boi_scheme == "A (3Y/50%)":
-        boi_years, boi_cap_ratio = 3, 0.50
+    # BOI ๓/๒๕๖๘ — BESS + Solar bundle
+    # Eligible cap = min(BESS CAPEX, 12,000,000 THB per MW of Solar PV)
+    # CIT exempt = 3 ปี, cap = 50% of eligible
+    boi_eligible_cap_per_mw = 12_000_000   # 12M THB per MW of Solar PV
+    if use_boi and solar_mw > 0:
+        boi_eligible = min(bess_capex, boi_eligible_cap_per_mw * solar_mw)
+        boi_cap = boi_eligible * 0.50       # 50% cap
+        boi_years = 3
     else:
-        boi_years, boi_cap_ratio = 8, 1.00
-    boi_cap = bess_eligible * boi_cap_ratio
+        boi_cap   = 0.0
+        boi_years = 0
 
     rows = []
     cum_cf  = -total_investment
@@ -103,7 +106,7 @@ def calc_solar_bess(
 
         full_cit = max(0.0, pre_tax * cit)
         if cum_exempt < boi_cap and y <= boi_years:
-            exempt   = min(full_cit, boi_cap - cum_exempt)
+            exempt   = min(max(0.0, pre_tax * cit), boi_cap - cum_exempt)
             cum_exempt += exempt
             tax_paid = full_cit - exempt
         else:
@@ -233,7 +236,21 @@ def calc_model(p, ass, units):
     customer_price = equip_capex + bundled_om_total
     boi_duty_saving = equip_capex * ass["boi_duty_pct"]
     net_capex = customer_price - boi_duty_saving
-    boi_cap = net_capex * ass["boi_cap_x"]
+
+    # ── BOI ๓/๒๕๖๘ ─────────────────────────────────────────────────────────────
+    # เงื่อนไข: BESS ต้องติดคู่กับ Solar PV เพื่อขอ BOI
+    # Eligible = min(BESS CAPEX, 12M THB × MW ของ Solar PV)
+    # CIT ยกเว้น 3 ปี, วงเงินสูงสุด 50% ของ eligible investment
+    solar_ref_mw = ass.get("solar_ref_mw", 0.0)
+    use_boi      = ass.get("use_boi", False) and solar_ref_mw > 0
+    if use_boi:
+        boi_eligible = min(equip_capex, 12_000_000 * solar_ref_mw)
+        boi_cap      = boi_eligible * 0.50   # 50% cap
+        boi_years    = 3
+    else:
+        boi_eligible = 0.0
+        boi_cap      = 0.0
+        boi_years    = 0
 
     # ── แยก charge / discharge efficiency ──────────────────────────────────────
     eta_c   = ass["charge_eff"]        # ηc: Grid → Battery
@@ -251,8 +268,9 @@ def calc_model(p, ass, units):
 
     years = list(range(1, 31))
     rows = []
-    cum_nb = cum_epc = cum_ppa = -customer_price
-    cum_exempt_epc = cum_exempt_ppa = 0.0
+    cum_nb  = -customer_price
+    cum_boi = -customer_price
+    cum_exempt_boi = 0.0
 
     for y in years:
         deg = p["deg"][y-1]
@@ -287,27 +305,19 @@ def calc_model(p, ass, units):
 
         tax_nb = max(0.0, pre_tax * ass["cit"])
 
-        # Bug fix: exempt ต้องไม่ติดลบ (กรณี pre_tax < 0)
-        if cum_exempt_epc < boi_cap and y <= ass["boi_epc_y"]:
-            exempt_epc = min(max(0.0, pre_tax * ass["cit"]), boi_cap - cum_exempt_epc)
-            cum_exempt_epc += exempt_epc
-            tax_epc = max(0.0, pre_tax * ass["cit"] - exempt_epc)
+        # BOI ๓/๒๕๖๘ — single scheme, 3Y, 50% cap
+        if use_boi and cum_exempt_boi < boi_cap and y <= boi_years:
+            exempt_boi = min(max(0.0, pre_tax * ass["cit"]), boi_cap - cum_exempt_boi)
+            cum_exempt_boi += exempt_boi
+            tax_boi = max(0.0, pre_tax * ass["cit"] - exempt_boi)
         else:
-            tax_epc = tax_nb
-
-        if cum_exempt_ppa < boi_cap and y <= ass["boi_ppa_y"]:
-            exempt_ppa = min(max(0.0, pre_tax * ass["cit"]), boi_cap - cum_exempt_ppa)
-            cum_exempt_ppa += exempt_ppa
-            tax_ppa = max(0.0, pre_tax * ass["cit"] - exempt_ppa)
-        else:
-            tax_ppa = tax_nb
+            exempt_boi = 0.0
+            tax_boi    = tax_nb
 
         net_nb  = pre_tax - tax_nb
-        net_epc = pre_tax - tax_epc
-        net_ppa = pre_tax - tax_ppa
+        net_boi = pre_tax - tax_boi
         cum_nb  += net_nb
-        cum_epc += net_epc
-        cum_ppa += net_ppa
+        cum_boi += net_boi
 
         # Energy waterfall (Cycle 2 grid-side only)
         e_in_grid   = cap_kwh / eta_c * working_days * deg
@@ -337,14 +347,12 @@ def calc_model(p, ass, units):
             "OM Cost": om_cost,
             "Pre-Tax CF": pre_tax,
             "Tax Non-BOI": tax_nb,
-            "Tax EPC": tax_epc,
-            "Tax PPA": tax_ppa,
+            "BOI Exempt": exempt_boi,
+            "Tax BOI ๓/๒๕๖๘": tax_boi,
             "Net CF Non-BOI": net_nb,
-            "Net CF EPC": net_epc,
-            "Net CF PPA": net_ppa,
+            "Net CF BOI ๓/๒๕๖๘": net_boi,
             "Cum CF Non-BOI": cum_nb,
-            "Cum CF EPC": cum_epc,
-            "Cum CF PPA": cum_ppa,
+            "Cum CF BOI ๓/๒๕๖๘": cum_boi,
         })
 
     df = pd.DataFrame(rows)
@@ -352,7 +360,14 @@ def calc_model(p, ass, units):
     def payback(col):
         s = df[col]
         idx = s[s >= 0].index
-        return int(df.loc[idx[0], "Year"]) if len(idx) else None
+        if len(idx) == 0:
+            return None
+        y = int(df.loc[idx[0], "Year"])
+        if y == 1:
+            return 1
+        prev = float(df.loc[idx[0]-1, col])
+        curr = float(df.loc[idx[0],   col])
+        return (y - 1) + (-prev / (curr - prev))
 
     def irr_at(col, yr):
         cfs = [-customer_price] + list(df[df["Year"] <= yr][col])
@@ -363,15 +378,16 @@ def calc_model(p, ass, units):
         return sum(c/(1+wacc)**i for i, c in enumerate(cfs))
 
     metrics = {}
-    for tag, col in [("NB","Net CF Non-BOI"),("EPC","Net CF EPC"),("PPA","Net CF PPA")]:
+    for tag, col in [("NB","Net CF Non-BOI"), ("BOI","Net CF BOI ๓/๒๕๖๘")]:
+        cum_c = col.replace("Net CF", "Cum CF")
         metrics[tag] = {
-            "payback": payback(f"Cum CF {col.replace('Net CF ','')}"),
-            "irr_15": irr_at(col, 15),
-            "irr_20": irr_at(col, 20),
-            "irr_30": irr_at(col, 30),
-            "npv_30": npv_at(col, 30, ass["wacc"]),
-            "cum_15": df[df["Year"]==15][f"Cum CF {col.replace('Net CF ','')}"].values[0],
-            "cum_30": df[df["Year"]==30][f"Cum CF {col.replace('Net CF ','')}"].values[0],
+            "payback": payback(cum_c),
+            "irr_15":  irr_at(col, 15),
+            "irr_20":  irr_at(col, 20),
+            "irr_30":  irr_at(col, 30),
+            "npv_30":  npv_at(col, 30, ass["wacc"]),
+            "cum_15":  float(df[df["Year"]==15][cum_c].values[0]),
+            "cum_30":  float(df[df["Year"]==30][cum_c].values[0]),
         }
 
     # Leasing
@@ -387,8 +403,8 @@ def calc_model(p, ass, units):
         "monthly_pmt": pmt, "annual_pmt": annual_pmt,
     }
 
-    ppa_cust_cum30 = float(df["Cum CF PPA"].iloc[-1]) * ass["ppa_share"]
-    ppa_owner_cum30 = float(df["Cum CF PPA"].iloc[-1]) * (1 - ass["ppa_share"])
+    ppa_cust_cum30  = float(df["Cum CF BOI ๓/๒๕๖๘"].iloc[-1]) * ass["ppa_share"]
+    ppa_owner_cum30 = float(df["Cum CF BOI ๓/๒๕๖๘"].iloc[-1]) * (1 - ass["ppa_share"])
 
     return {
         "df": df,
@@ -397,6 +413,8 @@ def calc_model(p, ass, units):
         "equip_capex": equip_capex,
         "annual_om": annual_om,
         "boi_duty_saving": boi_duty_saving,
+        "boi_eligible": boi_eligible,
+        "boi_cap": boi_cap,
         "metrics": metrics,
         "lease": lease,
         "ppa_cust_cum30": ppa_cust_cum30,
@@ -437,13 +455,13 @@ with st.sidebar:
     st.markdown("**🗓️ TOU Calendar — วันที่ Arbitrage ได้จริง**")
     st.caption("ไทย: จันทร์–ศุกร์ 09:00–22:00 เท่านั้น เสาร์/อาทิตย์/หยุดนักขัตฤกษ์ = Off-Peak ทั้งวัน")
     weekdays_yr   = st.number_input("วันจันทร์–ศุกร์/ปี", min_value=240, max_value=262, value=261)
-    pub_holidays  = st.number_input("วันหยุดนักขัตฤกษ์/ปี (ตกวันทำการ)", min_value=0, max_value=20, value=13)
+    pub_holidays  = st.number_input("วันหยุดนักขัตฤกษ์/ปี (ตกวันทำการ)", min_value=0, max_value=20, value=14)
     working_days  = int(weekdays_yr - pub_holidays)
     st.info(f"วันที่ Arbitrage ได้จริง: **{working_days} วัน/ปี** (vs 365 วัน = overestimate {365-working_days} วัน)")
 
     st.markdown("**⚡ Energy Loss (แยก Charge / Discharge)**")
-    charge_eff    = st.slider("Charging Efficiency ηc (%)", 90, 99, 97, 1) / 100
-    discharge_eff = st.slider("Discharging Efficiency ηd (%)", 90, 99, 97, 1) / 100
+    charge_eff    = st.slider("Charging Efficiency ηc (%)", 90, 99, 94, 1) / 100
+    discharge_eff = st.slider("Discharging Efficiency ηd (%)", 90, 99, 94, 1) / 100
     rte_calc      = charge_eff * discharge_eff
     aux_kw        = st.number_input("Aux Load — BMS/Cooling (kW)", min_value=0.0, max_value=50.0, value=5.0, step=0.5)
     st.info(f"RTE = ηc × ηd = {charge_eff*100:.0f}% × {discharge_eff*100:.0f}% = **{rte_calc*100:.1f}%** | Aux: {aux_kw} kW × 8,760 ชม./ปี")
@@ -471,13 +489,33 @@ with st.sidebar:
     st.divider()
 
     # ── BOI & Tax ──
-    st.subheader("🏛️ BOI & ภาษี")
-    cit         = st.slider("CIT Rate (%)", 0, 30, 20) / 100
-    wacc        = st.slider("WACC / Discount Rate (%)", 3.0, 15.0, 7.0, 0.5) / 100
-    boi_epc_y   = st.number_input("BOI EPC – Section 7 (ปีที่ยกเว้น CIT)", 1, 10, 3)
-    boi_ppa_y   = st.number_input("BOI PPA – Section 7.1 (ปีที่ยกเว้น CIT)", 1, 15, 8)
-    boi_cap_x   = st.slider("BOI Cap (× CAPEX)", 0.5, 2.0, 1.0, 0.1)
-    boi_duty_pct= st.slider("BOI Import Duty Saving (%)", 0.0, 10.0, 5.0, 0.5) / 100
+    st.subheader("🏛️ BOI ๓/๒๕๖๘ & ภาษี")
+    cit  = st.slider("CIT Rate (%)", 0, 30, 20) / 100
+    wacc = st.slider("WACC / Discount Rate (%)", 3.0, 15.0, 7.0, 0.5) / 100
+
+    st.markdown("**BOI ๓/๒๕๖๘ — Energy Storage**")
+    st.caption(
+        "• ยกเว้น CIT **3 ปี**, วงเงิน **50%** ของ eligible investment\n"
+        "• Eligible cap = ≤ **12M THB per MW** ของ Solar PV ที่ติดคู่กัน\n"
+        "• ⚠️ BESS อยู่เดี่ยวไม่ได้ขอ BOI — ต้องมี Solar PV"
+    )
+    use_boi = st.toggle("ขอ BOI ๓/๒๕๖๘ (มี Solar คู่กัน)", value=False)
+    if use_boi:
+        solar_ref_mw = st.number_input(
+            "Solar PV Reference (MW) — สำหรับคำนวณ BOI Cap",
+            min_value=0.01, max_value=100.0, value=0.25, step=0.05,
+            format="%.2f",
+            help="MW ของ Solar PV ที่ติดคู่กับ BESS (ใช้คำนวณ eligible = min(BESS CAPEX, 12M × MW))"
+        )
+        boi_eligible_preview = 12_000_000 * solar_ref_mw
+        st.info(
+            f"BOI eligible cap (Solar {solar_ref_mw:.2f} MW): **{fmt_thb(boi_eligible_preview)}**\n\n"
+            f"วงเงิน CIT ยกเว้นสูงสุด (50%): **{fmt_thb(boi_eligible_preview * 0.5)}**"
+        )
+    else:
+        solar_ref_mw = 0.0
+
+    boi_duty_pct = st.slider("BOI Import Duty Saving (%)", 0.0, 10.0, 5.0, 0.5) / 100
 
     st.divider()
 
@@ -503,8 +541,8 @@ ass = {
     "dual_cycle": dual_cycle, "solar_days": solar_days, "solar_realization": solar_realization,
     "om_pct": om_pct, "bundled_om_years": bundled_om_years,
     "cit": cit, "wacc": wacc,
-    "boi_epc_y": boi_epc_y, "boi_ppa_y": boi_ppa_y,
-    "boi_cap_x": boi_cap_x, "boi_duty_pct": boi_duty_pct,
+    "use_boi": use_boi, "solar_ref_mw": solar_ref_mw,
+    "boi_duty_pct": boi_duty_pct,
     "fx": fx, "margin": margin,
     "lease_rate": lease_rate, "lease_months": lease_months,
     "lease_down": lease_down, "ppa_share": ppa_share,
@@ -558,16 +596,17 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "📋 Cash Flow ตา
 # ──────────────────────────────────────────────────────────────────────────────
 with tab1:
     # BOI Scenario selector
-    scenario_label = st.radio("BOI Scenario", ["Non-BOI", "EPC (Section 7)", "PPA (Section 7.1)"], horizontal=True)
-    scenario_key = {"Non-BOI": "NB", "EPC (Section 7)": "EPC", "PPA (Section 7.1)": "PPA"}[scenario_label]
+    scenario_opts = ["Non-BOI", "BOI ๓/๒๕๖๘ (3Y/50%)"]
+    scenario_label = st.radio("BOI Scenario", scenario_opts, horizontal=True)
+    scenario_key = {"Non-BOI": "NB", "BOI ๓/๒๕๖๘ (3Y/50%)": "BOI"}[scenario_label]
     sm = m[scenario_key]
-    cum_col = {"NB":"Cum CF Non-BOI","EPC":"Cum CF EPC","PPA":"Cum CF PPA"}[scenario_key]
-    net_col = {"NB":"Net CF Non-BOI","EPC":"Net CF EPC","PPA":"Net CF PPA"}[scenario_key]
+    cum_col = {"NB": "Cum CF Non-BOI", "BOI": "Cum CF BOI ๓/๒๕๖๘"}[scenario_key]
+    net_col = {"NB": "Net CF Non-BOI", "BOI": "Net CF BOI ๓/๒๕๖๘"}[scenario_key]
 
     st.subheader("📌 Key Metrics")
     c1,c2,c3,c4,c5 = st.columns(5)
     pb = sm["payback"]
-    c1.metric("Payback Year", f"ปีที่ {pb}" if pb else "ไม่ถึง 30Y")
+    c1.metric("Payback Year", f"ปีที่ {pb:.1f}" if pb else "ไม่ถึง 30Y")
     irr15 = sm["irr_15"]
     c2.metric("IRR 15Y", f"{irr15*100:.1f}%" if irr15 else "N/A")
     irr30 = sm["irr_30"]
@@ -576,10 +615,14 @@ with tab1:
     c5.metric("Cum CF 30Y", fmt_thb(sm["cum_30"]))
 
     st.divider()
-    c6,c7,c8 = st.columns(3)
+    c6,c7,c8,c9 = st.columns(4)
     c6.metric("Customer Price (upfront)", fmt_thb(result["customer_price"]))
     c7.metric("NET CAPEX (หลัง BOI Duty)", fmt_thb(result["net_capex"]))
     c8.metric("BOI Duty Saving", fmt_thb(result["boi_duty_saving"]))
+    if use_boi:
+        c9.metric("BOI CIT Cap (50%)", fmt_thb(result["boi_cap"]))
+    else:
+        c9.metric("BOI CIT Cap", "ไม่ได้ขอ BOI")
 
     st.divider()
 
@@ -599,13 +642,15 @@ with tab1:
         ))
         # Payback marker
         if pb:
-            pb_val = float(df[df["Year"]==pb][cum_col].values[0])
-            fig_cum.add_trace(go.Scatter(
-                x=[pb], y=[pb_val], mode="markers+text",
-                marker=dict(color="gold", size=12, symbol="star"),
-                text=[f"Payback Y{pb}"], textposition="top center",
-                showlegend=False
-            ))
+            pb_y = int(pb)
+            if pb_y <= 30 and pb_y >= 1:
+                pb_val = float(df[df["Year"]==pb_y][cum_col].values[0])
+                fig_cum.add_trace(go.Scatter(
+                    x=[pb], y=[pb_val], mode="markers+text",
+                    marker=dict(color="gold", size=12, symbol="star"),
+                    text=[f"Payback Y{pb:.1f}"], textposition="top center",
+                    showlegend=False
+                ))
         # Loan overlay
         if use_loan:
             net_col_vals = list(df[net_col])
@@ -659,13 +704,13 @@ with tab1:
         st.divider()
 
     # BOI scenario comparison
-    st.subheader("🏛️ เปรียบเทียบ 3 BOI Scenarios")
+    st.subheader("🏛️ เปรียบเทียบ: Non-BOI vs BOI ๓/๒๕๖๘")
     boi_rows = []
-    for label, key in [("Non-BOI","NB"),("EPC (Section 7)","EPC"),("PPA (Section 7.1)","PPA")]:
+    for label, key in [("Non-BOI","NB"), ("BOI ๓/๒๕๖๘ (3Y/50%)","BOI")]:
         sm2 = m[key]
         boi_rows.append({
             "Scenario": label,
-            "Payback Year": f"ปีที่ {sm2['payback']}" if sm2["payback"] else ">30Y",
+            "Payback Year": f"ปีที่ {sm2['payback']:.1f}" if sm2["payback"] else ">30Y",
             "IRR 15Y": f"{sm2['irr_15']*100:.1f}%" if sm2["irr_15"] else "N/A",
             "IRR 20Y": f"{sm2['irr_20']*100:.1f}%" if sm2["irr_20"] else "N/A",
             "IRR 30Y": f"{sm2['irr_30']*100:.1f}%" if sm2["irr_30"] else "N/A",
@@ -673,13 +718,18 @@ with tab1:
             "Cum CF 15Y": fmt_thb(sm2["cum_15"]),
             "Cum CF 30Y": fmt_thb(sm2["cum_30"]),
         })
+    if use_boi:
+        boi_cap_val = result["boi_cap"]
+        st.caption(f"BOI ๓/๒๕๖๘: Solar {solar_ref_mw:.2f} MW → eligible cap {fmt_thb(result['boi_eligible'])} → CIT cap 50% = **{fmt_thb(boi_cap_val)}**")
+    else:
+        st.caption("⚠️ ยังไม่ได้เปิดใช้ BOI — ผลลัพธ์ BOI จะเท่ากับ Non-BOI (เปิดที่ Sidebar > BOI ๓/๒๕๖๘)")
     st.dataframe(pd.DataFrame(boi_rows).set_index("Scenario"), use_container_width=True)
 
     # Leasing & PPA summary
     st.divider()
     col_lea, col_ppa = st.columns(2)
     with col_lea:
-        st.subheader("🏦 Leasing Model (EPC 3Y BOI)")
+        st.subheader("🏦 Leasing Model")
         lea = result["lease"]
         st.table(pd.DataFrame({
             "รายการ": ["Down Payment","Financed Amount","Monthly PMT","Annual PMT"],
@@ -688,10 +738,13 @@ with tab1:
         }).set_index("รายการ"))
 
     with col_ppa:
-        st.subheader("🤝 PPA / ESCO Model (PPA 8Y BOI)")
+        st.subheader("🤝 PPA / ESCO Model")
         y1_gross = float(df["Gross Saving"].iloc[0])
+        boi_label = "BOI ๓/๒๕๖๘" if use_boi else "Non-BOI"
         st.table(pd.DataFrame({
-            "รายการ": [f"Customer Share ({ppa_share*100:.0f}%)","Owner Share","Y1 Customer Saving","Cum Customer Saving 30Y","Cum Owner Revenue 30Y"],
+            "รายการ": [f"Customer Share ({ppa_share*100:.0f}%)","Owner Share",
+                       "Y1 Customer Saving",f"Cum Customer Saving 30Y ({boi_label})",
+                       f"Cum Owner Revenue 30Y ({boi_label})"],
             "มูลค่า": [f"{ppa_share*100:.0f}%", f"{(1-ppa_share)*100:.0f}%",
                        fmt_thb(y1_gross * ppa_share),
                        fmt_thb(result["ppa_cust_cum30"]),
@@ -701,10 +754,10 @@ with tab1:
 # ──────────────────────────────────────────────────────────────────────────────
 with tab2:
     st.subheader(f"📋 Year-by-Year Cash Flow — {selected_product}")
-    scenario_label2 = st.radio("BOI Scenario", ["Non-BOI", "EPC (Section 7)", "PPA (Section 7.1)"], horizontal=True, key="t2")
-    sk2 = {"Non-BOI": "NB", "EPC (Section 7)": "EPC", "PPA (Section 7.1)": "PPA"}[scenario_label2]
-    net_col2 = {"NB":"Net CF Non-BOI","EPC":"Net CF EPC","PPA":"Net CF PPA"}[sk2]
-    cum_col2 = {"NB":"Cum CF Non-BOI","EPC":"Cum CF EPC","PPA":"Cum CF PPA"}[sk2]
+    scenario_label2 = st.radio("BOI Scenario", ["Non-BOI", "BOI ๓/๒๕๖๘ (3Y/50%)"], horizontal=True, key="t2")
+    sk2 = {"Non-BOI": "NB", "BOI ๓/๒๕๖๘ (3Y/50%)": "BOI"}[scenario_label2]
+    net_col2 = {"NB":"Net CF Non-BOI", "BOI":"Net CF BOI ๓/๒๕๖๘"}[sk2]
+    cum_col2 = {"NB":"Cum CF Non-BOI", "BOI":"Cum CF BOI ๓/๒๕๖๘"}[sk2]
 
     # ── Energy Loss Waterfall (Y1) ──────────────────────────────────────────────
     y1r = df.iloc[0]
@@ -747,7 +800,8 @@ with tab2:
                  "C2 Grid Energy Out (kWh)","C2 Arb Revenue (THB)",
                  "E In from Grid (kWh)","Charging Loss (kWh)","Energy Out (kWh)",
                  "On-Peak (THB/kWh)","Off-Peak (THB/kWh)",
-                 "Arb Margin C2 (THB/kWh)","Gross Saving","Aux Cost","OM Cost","Pre-Tax CF",net_col2,cum_col2]
+                 "Arb Margin C2 (THB/kWh)","Gross Saving","Aux Cost","OM Cost","Pre-Tax CF",
+                 "BOI Exempt", net_col2, cum_col2]
     display_cols = [c for c in base_cols if c in df.columns]
     df_display = df[display_cols].copy()
 
@@ -755,7 +809,8 @@ with tab2:
     fmt_int_cols = ["C1 Solar Energy Out (kWh)","C1 Solar Revenue (THB)",
                     "C2 Grid Energy Out (kWh)","C2 Arb Revenue (THB)",
                     "E In from Grid (kWh)","Charging Loss (kWh)","Energy Out (kWh)",
-                    "Gross Saving","Aux Cost","OM Cost","Pre-Tax CF",net_col2,cum_col2]
+                    "Gross Saving","Aux Cost","OM Cost","Pre-Tax CF",
+                    "BOI Exempt", net_col2, cum_col2]
     fmt_dec_cols = ["On-Peak (THB/kWh)","Off-Peak (THB/kWh)","Arb Margin C2 (THB/kWh)"]
     for col in fmt_int_cols:
         if col in df_display.columns:
@@ -774,9 +829,9 @@ with tab2:
 # ──────────────────────────────────────────────────────────────────────────────
 with tab3:
     st.subheader("🔄 เปรียบเทียบทุก Product ด้วย Assumptions เดียวกัน")
-    scenario_label3 = st.radio("BOI Scenario", ["Non-BOI", "EPC (Section 7)", "PPA (Section 7.1)"], horizontal=True, key="t3")
-    sk3 = {"Non-BOI": "NB", "EPC (Section 7)": "EPC", "PPA (Section 7.1)": "PPA"}[scenario_label3]
-    cum_col3 = {"NB":"Cum CF Non-BOI","EPC":"Cum CF EPC","PPA":"Cum CF PPA"}[sk3]
+    scenario_label3 = st.radio("BOI Scenario", ["Non-BOI", "BOI ๓/๒๕๖๘ (3Y/50%)"], horizontal=True, key="t3")
+    sk3 = {"Non-BOI": "NB", "BOI ๓/๒๕๖๘ (3Y/50%)": "BOI"}[scenario_label3]
+    cum_col3 = {"NB":"Cum CF Non-BOI", "BOI":"Cum CF BOI ๓/๒๕๖๘"}[sk3]
 
     comp_rows = []
     cum_fig = go.Figure()
@@ -791,7 +846,7 @@ with tab3:
             "Cap (kWh)": f"{r['cap_kwh']:,}",
             "Customer Price": fmt_thb(r["customer_price"]),
             "NET CAPEX": fmt_thb(r["net_capex"]),
-            "Payback": f"ปีที่ {sm3['payback']}" if sm3["payback"] else ">30Y",
+            "Payback": f"ปีที่ {sm3['payback']:.1f}" if sm3["payback"] else ">30Y",
             "IRR 15Y": f"{sm3['irr_15']*100:.1f}%" if sm3["irr_15"] else "N/A",
             "IRR 30Y": f"{sm3['irr_30']*100:.1f}%" if sm3["irr_30"] else "N/A",
             "NPV 30Y": fmt_thb(sm3["npv_30"]),
@@ -850,7 +905,10 @@ with tab4:
 # ──────────────────────────────────────────────────────────────────────────────
 with tab5:
     st.subheader("☀️ Solar+BESS Bundle — กรอกข้อมูล")
-    st.caption("Solar ชาร์จแบตฟรี (ต้นทุน 0) + BESS Arbitrage + Demand Charge Reduction · BOI เฉพาะ BESS")
+    st.caption(
+        "Solar ชาร์จแบตฟรี (ต้นทุน 0) + BESS Arbitrage + Demand Charge Reduction\n\n"
+        "**BOI ๓/๒๕๖๘**: BESS + Solar → 3Y CIT exempt, 50% cap, ≤ 12M THB/MW Solar PV"
+    )
 
     col_s, col_b2 = st.columns(2)
 
@@ -895,8 +953,17 @@ with tab5:
         sb_demand_rate= st.number_input("Demand Rate (THB/kW/เดือน)", value=74.14, step=1.0, format="%.2f")
 
     with col_r:
-        st.markdown("**🏛️ BOI & ปัจจัยอื่น**")
-        sb_boi_scheme   = st.radio("BOI Scheme (BESS only)", ["A (3Y/50%)", "B (8Y/100%)"])
+        st.markdown("**🏛️ BOI ๓/๒๕๖๘ & ปัจจัยอื่น**")
+        sb_use_boi = st.toggle("ขอ BOI ๓/๒๕๖๘ (BESS + Solar)", value=True, key="sb_boi")
+        if sb_use_boi:
+            sol_mw_preview = sol_kwp / 1000
+            bess_capex_preview = (bess_kwh_input / 1000) * bess_capex_mwh
+            eligible_preview = min(bess_capex_preview, 12_000_000 * sol_mw_preview)
+            st.caption(
+                f"Solar {sol_mw_preview:.3f} MW → eligible = min(BESS CAPEX, 12M×{sol_mw_preview:.3f}MW)\n\n"
+                f"= min({fmt_thb(bess_capex_preview)}, {fmt_thb(12_000_000 * sol_mw_preview)})\n\n"
+                f"= **{fmt_thb(eligible_preview)}** → CIT cap 50% = **{fmt_thb(eligible_preview * 0.5)}**"
+            )
         sb_real_factor  = st.slider("Realization Factor (%)", 50, 100, 70, 5) / 100
         sb_om_pct       = st.slider("OM % of Total CAPEX (Y11+)", 0.3, 2.0, 0.5, 0.1, key="sb_om") / 100
         sb_bundled_om   = st.number_input("Bundled OM ปี", min_value=1, max_value=15, value=10, key="sb_bom")
@@ -946,7 +1013,7 @@ with tab5:
         bundled_om_years   = sb_bundled_om,
         cit                = cit,
         wacc               = wacc,
-        boi_scheme         = sb_boi_scheme,
+        use_boi            = sb_use_boi,
         realization_factor = sb_real_factor,
         solar_charge_ratio = solar_charge_ratio,
     )
@@ -987,7 +1054,8 @@ with tab5:
     k6.metric("Total Investment", fmt_thb(sb_m["total_investment"]))
     k7.metric("Solar CAPEX", fmt_thb(sb_m["solar_capex"]))
     k8.metric("BESS CAPEX", fmt_thb(sb_m["bess_capex"]))
-    k9.metric("BOI Cap (BESS)", fmt_thb(sb_m["boi_cap"]))
+    boi_label_sol = f"BOI Cap (50%) = {fmt_thb(sb_m['boi_cap'])}" if sb_use_boi else "ไม่ได้ขอ BOI"
+    k9.metric("BOI ๓/๒๕๖๘ CIT Cap", fmt_thb(sb_m["boi_cap"]) if sb_use_boi else "—")
 
     st.divider()
 
@@ -1056,27 +1124,28 @@ with tab5:
     # ── Comparison vs BESS-only ──
     st.subheader("🆚 เปรียบเทียบ: Solar+BESS vs BESS Only")
     r_bess_only = calc_model(p_override, ass, n_units)
-    bess_sk = "EPC" if "EPC" in sb_boi_scheme else "PPA"
-    bess_cum_col = f"Cum CF {bess_sk}"
+    bess_cum_col = "Cum CF BOI ๓/๒๕๖๘" if use_boi else "Cum CF Non-BOI"
+    bess_scenario_label = "BOI ๓/๒๕๖๘" if use_boi else "Non-BOI"
 
     comp_cum_fig = go.Figure()
     comp_cum_fig.add_hline(y=0, line_dash="dash", line_color="gray", line_width=1)
     comp_cum_fig.add_trace(go.Scatter(
         x=[0]+list(sb_df["Year"]),
         y=[-sb_m["total_investment"]]+list(sb_df["Cum CF (THB)"]),
-        name=f"☀️ Solar+BESS Bundle ({sb_boi_scheme})",
+        name=f"☀️ Solar+BESS Bundle ({'BOI ๓/๒๕๖๘' if sb_use_boi else 'Non-BOI'})",
         line=dict(color="#ffd166", width=2.5)
     ))
     comp_cum_fig.add_trace(go.Scatter(
         x=[0]+list(r_bess_only["df"]["Year"]),
         y=[-r_bess_only["customer_price"]]+list(r_bess_only["df"][bess_cum_col]),
-        name=f"🔋 BESS Only — {selected_product.split('(')[0].strip()} (EPC BOI)",
+        name=f"🔋 BESS Only — {selected_product.split('(')[0].strip()} ({bess_scenario_label})",
         line=dict(color="#00b4d8", width=2.5, dash="dash")
     ))
     comp_cum_fig.update_layout(xaxis_title="ปี", yaxis_title="THB (Cumulative CF)",
                                 height=380, margin=dict(l=10,r=10,t=10,b=30))
     st.plotly_chart(comp_cum_fig, use_container_width=True)
 
+    boi_key_bess = "BOI" if use_boi else "NB"
     comp_table = pd.DataFrame([
         {
             "รายการ": "☀️ Solar+BESS Bundle",
@@ -1090,11 +1159,11 @@ with tab5:
         {
             "รายการ": f"🔋 BESS Only ({selected_product.split('(')[0].strip()})",
             "Investment": fmt_thb(r_bess_only["customer_price"]),
-            "Payback": f"{r_bess_only['metrics']['EPC']['payback']}Y" if r_bess_only["metrics"]["EPC"]["payback"] else ">30Y",
-            "IRR 15Y": f"{r_bess_only['metrics']['EPC']['irr_15']*100:.1f}%" if r_bess_only["metrics"]["EPC"]["irr_15"] else "N/A",
-            "IRR 30Y": f"{r_bess_only['metrics']['EPC']['irr_30']*100:.1f}%" if r_bess_only["metrics"]["EPC"]["irr_30"] else "N/A",
-            "NPV 30Y": fmt_thb(r_bess_only["metrics"]["EPC"]["npv_30"]),
-            "Cum CF 30Y": fmt_thb(r_bess_only["metrics"]["EPC"]["cum_30"]),
+            "Payback": f"{r_bess_only['metrics'][boi_key_bess]['payback']:.1f}Y" if r_bess_only["metrics"][boi_key_bess]["payback"] else ">30Y",
+            "IRR 15Y": f"{r_bess_only['metrics'][boi_key_bess]['irr_15']*100:.1f}%" if r_bess_only["metrics"][boi_key_bess]["irr_15"] else "N/A",
+            "IRR 30Y": f"{r_bess_only['metrics'][boi_key_bess]['irr_30']*100:.1f}%" if r_bess_only["metrics"][boi_key_bess]["irr_30"] else "N/A",
+            "NPV 30Y": fmt_thb(r_bess_only["metrics"][boi_key_bess]["npv_30"]),
+            "Cum CF 30Y": fmt_thb(r_bess_only["metrics"][boi_key_bess]["cum_30"]),
         }
     ]).set_index("รายการ")
     st.dataframe(comp_table, use_container_width=True)
@@ -1105,7 +1174,8 @@ with tab5:
                     "Demand Save (THB)","OM Cost (THB)","Pre-Tax CF (THB)","Net CF (THB)","Cum CF (THB)"]
         sb_display = sb_df.copy()
         for c in fmt_cols:
-            sb_display[c] = sb_display[c].map(lambda x: f"{x:,.0f}")
+            if c in sb_display.columns:
+                sb_display[c] = sb_display[c].map(lambda x: f"{x:,.0f}")
         sb_display["Sol Deg"] = sb_display["Sol Deg"].map(lambda x: f"{x:.4f}")
         sb_display["BESS Deg"] = sb_display["BESS Deg"].map(lambda x: f"{x:.4f}")
         sb_display["Year"] = sb_display["Year"].map(lambda x: f"Y{x}")

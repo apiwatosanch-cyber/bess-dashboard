@@ -48,11 +48,9 @@ def calc_solar_bess(
     cit, wacc,
     use_boi,                 # True = ใช้ BOI ๓/๒๕๖๘ (ต้องมี Solar)
     realization_factor,
-    # ── v14 Solar split (Operation Ratio) ──────────────────────────────────────
+    # ── v14 Solar split (Operation Ratio) — Zero Export ──────────────────────
     solar_direct_pct=0.60,   # Solar → Direct Load offset (ช่วง 09-17h)
-    solar_bess_pct=0.35,     # Solar → BESS charge (ปล่อยช่วงเย็น 17-22h)
-    solar_export_pct=0.05,   # Solar → Grid export (at lower export rate)
-    solar_export_rate=2.2,   # THB/kWh — MEA/PEA export (net metering)
+    solar_bess_pct=0.40,     # Solar → BESS charge (ปล่อยช่วงเย็น 17-22h); direct+bess=100%
     grid_cycles_day=1.0,     # Grid OP-charged cycles/day (อาจเป็น 0 ถ้าไม่ charge จาก grid)
     working_days=247,        # วันที่ grid arb ทำได้ (จ-ศ − หยุดนักขัตฤกษ์)
 ):
@@ -95,14 +93,13 @@ def calc_solar_bess(
         # --- Revenue streams (v14 aligned) ---
         solar_kwh_y = solar_kwh_y1 * sol_deg
 
-        # Solar revenue แยก 3 ส่วน:
+        # Solar revenue (Zero Export — ไฟทั้งหมดใช้ใน site):
         # (1) Direct Load offset — save on-peak rate ช่วง 09:00-17:00
-        solar_direct_kwh = solar_kwh_y * solar_direct_pct
+        # (2) BESS Charge portion — counted in BESS Solar Cycle below
+        # direct_pct + bess_pct = 100% (no grid export)
+        solar_direct_kwh  = solar_kwh_y * solar_direct_pct
         solar_direct_save = solar_direct_kwh * pk * realization_factor
-        # (2) Grid Export — ขายไฟ net-metering ราคาต่ำกว่า
-        solar_export_kwh = solar_kwh_y * solar_export_pct
-        solar_export_save = solar_export_kwh * solar_export_rate * realization_factor
-        solar_save = solar_direct_save + solar_export_save
+        solar_save        = solar_direct_save  # no export revenue
 
         # BESS revenue แยก 2 cycles (v14: Solar Cycle + Grid OP Cycle):
         # Solar Cycle — ชาร์จฟรีจาก Solar, ปล่อย 17-22h on-peak
@@ -143,9 +140,7 @@ def calc_solar_bess(
             "Solar kWh": solar_kwh_y,
             "Solar Direct kWh": solar_direct_kwh,
             "Solar BESS kWh": solar_bess_in,
-            "Solar Export kWh": solar_export_kwh,
             "Solar Direct Save (THB)": solar_direct_save,
-            "Solar Export Save (THB)": solar_export_save,
             "Solar Save (THB)": solar_save,
             "BESS Solar Out kWh": solar_bess_out,
             "BESS Grid Out kWh": bess_grid_out,
@@ -462,9 +457,8 @@ def recommend_sizing(
     solar_capex_per_mw=20_000_000,
     bess_capex_per_mwh=11_000_000,   # Turnkey AC ~10-12M/MWh (v14 default)
     roof_area_m2=0,                   # 0 = no limit; 1 MW ≈ 6,500 m²
-    self_consumption_target=0.90,     # ไม่ export เกิน 10%
+    self_consumption_target=0.90,     # Zero Export — Solar ทั้งหมดใช้ใน site
     demand_reduction_target=0.30,     # BESS shave 30% of peak demand
-    solar_export_rate=2.2,            # THB/kWh net metering
     cit=0.20,
 ):
     """
@@ -494,8 +488,8 @@ def recommend_sizing(
     solar_mw = max(solar_mw, 0.001)
 
     solar_kwh_yr = solar_mw * 1000 * cuf * 8760
-    # Solar save: 85% direct × on-peak rate + 15% export × 2.2 (v14 formula)
-    solar_save = solar_kwh_yr * (0.85 * on_peak_rate + 0.15 * solar_export_rate)
+    # Solar save: Zero Export — 100% offset ค่าไฟ on-peak rate ทั้งหมด
+    solar_save = solar_kwh_yr * on_peak_rate
     solar_capex = solar_mw * solar_capex_per_mw
     solar_pb    = solar_capex / solar_save if solar_save > 0 else None
 
@@ -1137,26 +1131,20 @@ with tab5:
 
     st.divider()
 
-    # ── Solar Split + 2-Cycle ──
-    st.markdown("**☀️ Solar Operation Split (v14)**")
+    # ── Solar Split + 2-Cycle (Zero Export) ──
+    st.markdown("**☀️ Solar Operation Split — Zero Export**")
     st.caption(
-        "Solar output แบ่งเป็น 3 ส่วน: Direct Load (offset ช่วงกลางวัน) + "
-        "BESS Charge (เก็บปล่อยช่วงเย็น 17-22h) + Grid Export (ขายคืนการไฟฟ้า)"
+        "ระบบ Zero Export: Solar output ทั้งหมดใช้ใน site เท่านั้น "
+        "แบ่งเป็น Direct Load (offset ช่วงกลางวัน 09-17h) + BESS Charge (เก็บปล่อยช่วงเย็น 17-22h) "
+        "รวมกัน = 100% ไม่มีขายคืนการไฟฟ้า"
     )
-    sp_c1, sp_c2, sp_c3, sp_c4 = st.columns(4)
+    sp_c1, sp_c2 = st.columns(2)
     with sp_c1:
         sb_solar_direct_pct = st.slider("Direct Load (%)", 30, 90, 60, 5, key="sb_sd") / 100
     with sp_c2:
-        sb_solar_bess_pct   = st.slider("→ BESS Charge (%)", 5, 60, 35, 5, key="sb_sb") / 100
-    with sp_c3:
-        _sb_export_pct = max(0.0, round(1.0 - sb_solar_direct_pct - sb_solar_bess_pct, 2))
-        st.metric("→ Export (auto)", f"{_sb_export_pct*100:.0f}%")
-        sb_solar_export_pct = _sb_export_pct
-    with sp_c4:
-        sb_export_rate = st.number_input("Export Rate (THB/kWh)", value=2.20, step=0.10, format="%.2f", key="sb_er")
-
-    if sb_solar_direct_pct + sb_solar_bess_pct > 1.0:
-        st.warning("⚠️ Direct + BESS > 100% — ปรับให้รวมกันไม่เกิน 100%")
+        sb_solar_bess_pct = round(1.0 - sb_solar_direct_pct, 2)
+        st.metric("→ BESS Charge (auto)", f"{sb_solar_bess_pct*100:.0f}%",
+                  help="= 100% − Direct Load%  (Zero Export)")
 
     gc1, gc2 = st.columns(2)
     with gc1:
@@ -1206,11 +1194,9 @@ with tab5:
         wacc                  = wacc,
         use_boi               = sb_use_boi,
         realization_factor    = sb_real_factor,
-        # v14 solar split
+        # v14 solar split (Zero Export: direct + bess = 100%)
         solar_direct_pct      = sb_solar_direct_pct,
         solar_bess_pct        = sb_solar_bess_pct,
-        solar_export_pct      = sb_solar_export_pct,
-        solar_export_rate     = sb_export_rate,
         grid_cycles_day       = sb_grid_cycles,
         working_days          = working_days,
     )
@@ -1258,19 +1244,17 @@ with tab5:
 
     # ── Y1 Revenue Breakdown ──
     y1 = sb_df.iloc[0]
-    st.subheader("💰 Y1 Revenue Breakdown (v14 split)")
-    rev_cols = st.columns(6)
+    st.subheader("💰 Y1 Revenue Breakdown (Zero Export)")
+    rev_cols = st.columns(5)
     rev_cols[0].metric("☀️ Solar Direct Save", fmt_thb(y1["Solar Direct Save (THB)"]),
-                        help=f"Solar {sb_solar_direct_pct*100:.0f}% → Direct Load × Peak Rate")
-    rev_cols[1].metric("📤 Solar Export Save", fmt_thb(y1["Solar Export Save (THB)"]),
-                        help=f"Solar {sb_solar_export_pct*100:.0f}% → Grid @ {sb_export_rate:.2f} THB/kWh")
-    rev_cols[2].metric("🔋 BESS Solar Cycle", fmt_thb(y1["BESS Solar Rev (THB)"]),
-                        help=f"Solar→BESS→Evening Discharge × Peak Rate")
-    rev_cols[3].metric("⚡ BESS Grid Cycle", fmt_thb(y1["BESS Grid Rev (THB)"]),
-                        help=f"Grid Off-Peak→BESS→Morning × Spread")
-    rev_cols[4].metric("🔌 Demand Save", fmt_thb(y1["Demand Save (THB)"]))
+                        help=f"Solar {sb_solar_direct_pct*100:.0f}% → Direct Load × Peak Rate (ช่วง 09-17h)")
+    rev_cols[1].metric("🔋 BESS Solar Cycle", fmt_thb(y1["BESS Solar Rev (THB)"]),
+                        help=f"Solar {sb_solar_bess_pct*100:.0f}% → BESS → Evening Discharge × Peak Rate (17-22h)")
+    rev_cols[2].metric("⚡ BESS Grid Cycle", fmt_thb(y1["BESS Grid Rev (THB)"]),
+                        help="Grid Off-Peak → BESS → Morning On-Peak × Spread")
+    rev_cols[3].metric("🔌 Demand Save", fmt_thb(y1["Demand Save (THB)"]))
     total_gross = y1["Solar Save (THB)"] + y1["BESS Arb (THB)"] + y1["Demand Save (THB)"]
-    rev_cols[5].metric("✅ Total Gross Y1", fmt_thb(total_gross))
+    rev_cols[4].metric("✅ Total Gross Y1", fmt_thb(total_gross))
 
     # Revenue mix pie
     pie_fig = go.Figure(go.Pie(

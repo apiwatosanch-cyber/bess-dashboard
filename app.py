@@ -423,6 +423,100 @@ def calc_model(p, ass, units):
     }
 
 
+# ── Sizing Recommendation Engine ─────────────────────────────────────────────
+def recommend_sizing(
+    annual_on_peak_kwh, annual_off_peak_kwh, avg_peak_kw,
+    on_peak_rate, off_peak_rate,
+    cuf=0.16, working_days=247, rte=0.88,
+    solar_capex_per_mw=20_000_000, bess_capex_per_mwh=6_000_000,
+):
+    """
+    คำนวณขนาด Solar + BESS ที่แนะนำจากข้อมูลบิลค่าไฟ
+
+    Thai TOU profile (Mon–Fri):
+      On-peak 09:00–22:00 = 13 h/day
+        └─ Solar overlaps: 09:00–17:00 = 8 h  (solar_fraction = 8/13)
+        └─ Evening no-solar: 17:00–22:00 = 5 h (evening_fraction = 5/13)
+    """
+    SOLAR_FRACTION   = 8 / 13   # ชั่วโมง on-peak ที่มีแดด
+    EVENING_FRACTION = 5 / 13   # ชั่วโมง on-peak เย็น/ค่ำ ไม่มีแดด
+    arb_margin = on_peak_rate - off_peak_rate / rte
+
+    daily_on_peak_kwh = annual_on_peak_kwh / max(working_days, 1)
+
+    scenarios = []
+    configs = [
+        ("🟡 Conservative", "#ffd166", 0.30, 2),
+        ("🔵 Moderate",     "#00b4d8", 0.60, 4),
+        ("🟢 Aggressive",   "#06d6a0", 0.90, 6),
+    ]
+    for label, color, solar_cov, batt_hr in configs:
+        # ── Solar ──────────────────────────────────────────────────────────
+        # ต้องการให้ solar cover (solar_cov)% ของ on-peak ช่วงกลางวัน
+        solar_target_kwh_yr = annual_on_peak_kwh * SOLAR_FRACTION * solar_cov
+        # kWp ที่ต้องการ = target kWh / (8760h × CUF)
+        solar_kwp = solar_target_kwh_yr / max(8760 * cuf, 1)
+        solar_mw  = solar_kwp / 1000
+
+        # ── BESS ───────────────────────────────────────────────────────────
+        # วิธีที่ 1: เก็บพลังงานช่วงเย็น 17:00-22:00 (ตาม coverage เดียวกัน)
+        evening_daily_kwh = daily_on_peak_kwh * EVENING_FRACTION * solar_cov
+        bess_a_kwh = evening_daily_kwh / rte   # หารด้วย ηd เพื่อ over-size นิดหน่อย
+
+        # วิธีที่ 2: peak demand × duration (grid arb)
+        bess_b_kwh = avg_peak_kw * batt_hr
+
+        # วิธีที่ 3: Solar:BESS ratio 1:4 (kWp:kWh) — rule of thumb ตลาดไทย
+        bess_c_kwh = solar_kwp * 4
+
+        # ใช้ค่ามากสุดจาก 3 วิธี
+        bess_kwh = max(bess_a_kwh, bess_b_kwh, bess_c_kwh)
+        bess_mwh = bess_kwh / 1000
+
+        # ── Cost ───────────────────────────────────────────────────────────
+        solar_capex = solar_mw  * solar_capex_per_mw
+        bess_capex  = bess_mwh  * bess_capex_per_mwh
+        total_capex = solar_capex + bess_capex
+
+        # ── Savings estimate (Y1 rough) ────────────────────────────────────
+        # Solar: on-peak kWh ที่ offset × rate × realization 70%
+        solar_save = solar_target_kwh_yr * on_peak_rate * 0.70
+
+        # BESS: 1 cycle/day arbitrage on working days
+        bess_arb_out_kwh = bess_kwh * rte * working_days
+        bess_save = bess_arb_out_kwh * max(arb_margin, 0) * 0.70
+
+        total_save = solar_save + bess_save
+        simple_pb  = total_capex / total_save if total_save > 0 else None
+
+        # ── BOI ๓/๒๕๖๘ preview ────────────────────────────────────────────
+        boi_eligible = min(bess_capex, 12_000_000 * solar_mw)
+        boi_cap      = boi_eligible * 0.50
+
+        scenarios.append({
+            "label":           label,
+            "color":           color,
+            "solar_coverage":  solar_cov,
+            "batt_hr":         batt_hr,
+            "solar_kwp":       round(solar_kwp),
+            "solar_mw":        solar_mw,
+            "bess_kwh":        round(bess_kwh),
+            "bess_mwh":        bess_mwh,
+            "sizing_method":   "Evening" if bess_a_kwh >= max(bess_b_kwh, bess_c_kwh)
+                               else ("Peak×hr" if bess_b_kwh >= bess_c_kwh else "1:4 ratio"),
+            "solar_capex":     solar_capex,
+            "bess_capex":      bess_capex,
+            "total_capex":     total_capex,
+            "solar_save_yr":   solar_save,
+            "bess_save_yr":    bess_save,
+            "total_save_yr":   total_save,
+            "simple_pb":       simple_pb,
+            "boi_eligible":    boi_eligible,
+            "boi_cap":         boi_cap,
+        })
+
+    return scenarios
+
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.title("⚡ BESS Arbitrage")
@@ -591,7 +685,10 @@ with st.sidebar:
 st.title("⚡ BESS Arbitrage Dashboard")
 st.caption(f"**{selected_product}** · {result['cap_kwh']:,} kWh · {n_units} unit(s) · อัปเดตแบบ Real-time")
 
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Dashboard", "📋 Cash Flow ตาราง", "🔄 เปรียบเทียบ 4 Products", "📄 Bill Analysis", "☀️ Solar+BESS Bundle"])
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "📊 Dashboard", "📋 Cash Flow ตาราง", "🔄 เปรียบเทียบ 4 Products",
+    "📄 Bill Analysis", "☀️ Solar+BESS Bundle", "📐 ประเมินขนาดระบบ"
+])
 
 # ──────────────────────────────────────────────────────────────────────────────
 with tab1:
@@ -1183,3 +1280,287 @@ with tab5:
 
         csv_sol = sb_df.to_csv(index=False).encode("utf-8")
         st.download_button("⬇️ Download CSV", csv_sol, "solar_bess_cashflow.csv", "text/csv")
+
+# ──────────────────────────────────────────────────────────────────────────────
+with tab6:
+    st.subheader("📐 ประเมินขนาดระบบ Solar + BESS จากบิลค่าไฟ")
+    st.caption(
+        "กรอกข้อมูลบิลค่าไฟในแถบด้านซ้าย (Sidebar → Bill ลูกค้า) "
+        "ระบบจะแนะนำขนาด Solar PV และ BESS ที่เหมาะสม 3 แบบ"
+    )
+
+    # ── Bill Summary ──────────────────────────────────────────────────────────
+    st.subheader("📄 สรุปบิลค่าไฟ (จาก Sidebar)")
+    _on_peak_yr  = sum(bill_data["On-Peak kWh"])
+    _off_peak_yr = sum(bill_data["Off-Peak kWh"])
+    _avg_kw      = sum(bill_data["kW Peak"]) / 12
+    _max_kw      = max(bill_data["kW Peak"])
+    _annual_cost = _on_peak_yr * on_peak_y1 + _off_peak_yr * off_peak_y1
+
+    b1, b2, b3, b4, b5 = st.columns(5)
+    b1.metric("On-Peak kWh/ปี",  f"{_on_peak_yr:,.0f} kWh")
+    b2.metric("Off-Peak kWh/ปี", f"{_off_peak_yr:,.0f} kWh")
+    b3.metric("Peak Demand เฉลี่ย", f"{_avg_kw:.0f} kW")
+    b4.metric("Peak Demand สูงสุด", f"{_max_kw:.0f} kW")
+    b5.metric("ค่าไฟประมาณ/ปี",  fmt_thb(_annual_cost))
+
+    # On-peak vs Off-peak proportion donut
+    pie_bill = go.Figure(go.Pie(
+        labels=["On-Peak kWh", "Off-Peak kWh"],
+        values=[_on_peak_yr, _off_peak_yr],
+        hole=0.5,
+        marker_colors=["#ef476f", "#00b4d8"],
+        textinfo="label+percent",
+    ))
+    pie_bill.update_layout(
+        title="สัดส่วน On-Peak / Off-Peak",
+        height=260, margin=dict(l=0, r=0, t=40, b=0),
+        showlegend=False,
+    )
+
+    # TOU time split diagram
+    fig_tou = go.Figure()
+    fig_tou.add_trace(go.Bar(
+        x=["09:00–17:00\n(Solar+On-Peak)", "17:00–22:00\n(เย็น On-Peak)", "22:00–09:00\n(Off-Peak)"],
+        y=[8/13 * _on_peak_yr, 5/13 * _on_peak_yr, _off_peak_yr],
+        marker_color=["#ffd166", "#ef476f", "#00b4d8"],
+        text=[f"{8/13*_on_peak_yr:,.0f} kWh\n(Solar ช่วยได้)",
+              f"{5/13*_on_peak_yr:,.0f} kWh\n(BESS เก็บไว้ใช้)",
+              f"{_off_peak_yr:,.0f} kWh\n(ชาร์จ BESS ราคาถูก)"],
+        textposition="inside",
+    ))
+    fig_tou.update_layout(
+        title="โครงสร้างการใช้ไฟตาม TOU (ประมาณจาก On-Peak/Off-Peak รวม)",
+        yaxis_title="kWh/ปี (ประมาณ)",
+        height=280, margin=dict(l=10, r=10, t=50, b=10),
+        showlegend=False,
+    )
+
+    tou_l, tou_r = st.columns([1, 2])
+    with tou_l:
+        st.plotly_chart(pie_bill, use_container_width=True)
+    with tou_r:
+        st.plotly_chart(fig_tou, use_container_width=True)
+
+    st.info(
+        "**วิธีอ่านกราฟ:** บิลค่าไฟแบ่ง on-peak (จ-ศ 09-22น) ออกเป็น 2 ส่วน:\n\n"
+        "☀️ **09:00–17:00** (8/13 ของ on-peak) → Solar PV ผลิตไฟได้โดยตรง\n\n"
+        "🔋 **17:00–22:00** (5/13 ของ on-peak) → ต้องใช้ BESS ที่เก็บจาก Solar หรือชาร์จ off-peak"
+    )
+
+    st.divider()
+
+    # ── Sizing Parameters ─────────────────────────────────────────────────────
+    st.subheader("⚙️ ปรับ Assumptions สำหรับการประเมิน")
+    sp1, sp2, sp3, sp4 = st.columns(4)
+    with sp1:
+        sz_cuf = st.slider("Solar CUF (%)", 12.0, 22.0, 16.0, 0.5, key="sz_cuf") / 100
+    with sp2:
+        sz_solar_capex = st.number_input("Solar CAPEX (THB/MW)", value=20_000_000, step=500_000,
+                                          format="%d", key="sz_sc")
+    with sp3:
+        sz_bess_capex = st.number_input("BESS CAPEX (THB/MWh)", value=6_000_000, step=100_000,
+                                         format="%d", key="sz_bc")
+    with sp4:
+        sz_working_days = st.number_input("Working Days/ปี", min_value=220, max_value=262,
+                                           value=working_days, key="sz_wd")
+
+    # ── Run Recommendations ───────────────────────────────────────────────────
+    scenarios = recommend_sizing(
+        annual_on_peak_kwh  = _on_peak_yr,
+        annual_off_peak_kwh = _off_peak_yr,
+        avg_peak_kw         = _avg_kw,
+        on_peak_rate        = on_peak_y1,
+        off_peak_rate       = off_peak_y1,
+        cuf                 = sz_cuf,
+        working_days        = sz_working_days,
+        rte                 = rte,
+        solar_capex_per_mw  = sz_solar_capex,
+        bess_capex_per_mwh  = sz_bess_capex,
+    )
+
+    st.divider()
+    st.subheader("💡 ขนาดระบบที่แนะนำ — 3 Scenarios")
+    st.caption(
+        "Conservative = Solar cover 30% of daytime on-peak, BESS 2h | "
+        "Moderate = 60%, 4h | Aggressive = 90%, 6h"
+    )
+
+    # ── Scenario Cards ────────────────────────────────────────────────────────
+    sc_cols = st.columns(3)
+    for col, sc in zip(sc_cols, scenarios):
+        with col:
+            st.markdown(f"### {sc['label']}")
+            st.markdown(f"**Solar coverage:** {sc['solar_coverage']*100:.0f}% of daytime on-peak")
+
+            st.markdown("**🌞 Solar PV**")
+            sv1, sv2 = st.columns(2)
+            sv1.metric("kWp", f"{sc['solar_kwp']:,}")
+            sv2.metric("MW",  f"{sc['solar_mw']:.3f}")
+
+            st.markdown("**🔋 BESS**")
+            bv1, bv2 = st.columns(2)
+            bv1.metric("kWh", f"{sc['bess_kwh']:,}")
+            bv2.metric("MWh", f"{sc['bess_mwh']:.2f}")
+
+            st.caption(f"Sizing method: **{sc['sizing_method']}** (duration ≈ {sc['batt_hr']}h)")
+
+            st.markdown("**💰 ประมาณการ (Y1)**")
+            st.metric("Total CAPEX",       fmt_thb(sc["total_capex"]))
+            st.metric("Annual Saving",     fmt_thb(sc["total_save_yr"]))
+            pb_txt = f"~{sc['simple_pb']:.1f} ปี" if sc["simple_pb"] else ">30Y"
+            st.metric("Simple Payback",    pb_txt)
+            st.metric("BOI CIT Cap (50%)", fmt_thb(sc["boi_cap"]))
+
+    st.divider()
+
+    # ── Comparison Bar Chart ──────────────────────────────────────────────────
+    st.subheader("📊 เปรียบเทียบ 3 Scenarios")
+    sc_labels = [s["label"].split(" ", 1)[1] for s in scenarios]  # strip emoji
+
+    comp_fig = go.Figure()
+    comp_fig.add_trace(go.Bar(
+        name="Solar CAPEX",
+        x=sc_labels,
+        y=[s["solar_capex"] for s in scenarios],
+        marker_color="#ffd166",
+        text=[fmt_thb(s["solar_capex"]) for s in scenarios],
+        textposition="inside",
+    ))
+    comp_fig.add_trace(go.Bar(
+        name="BESS CAPEX",
+        x=sc_labels,
+        y=[s["bess_capex"] for s in scenarios],
+        marker_color="#00b4d8",
+        text=[fmt_thb(s["bess_capex"]) for s in scenarios],
+        textposition="inside",
+    ))
+    comp_fig.update_layout(
+        barmode="stack", title="CAPEX รวม (Solar + BESS)",
+        yaxis_title="THB", height=300, margin=dict(l=10, r=10, t=50, b=10),
+    )
+
+    save_fig = go.Figure()
+    save_fig.add_trace(go.Bar(
+        name="Solar Saving",
+        x=sc_labels,
+        y=[s["solar_save_yr"] for s in scenarios],
+        marker_color="#ffd166",
+    ))
+    save_fig.add_trace(go.Bar(
+        name="BESS Arb Saving",
+        x=sc_labels,
+        y=[s["bess_save_yr"] for s in scenarios],
+        marker_color="#06d6a0",
+    ))
+    save_fig.update_layout(
+        barmode="stack", title="ประมาณการ Saving Y1",
+        yaxis_title="THB/ปี", height=300, margin=dict(l=10, r=10, t=50, b=10),
+    )
+
+    ch1, ch2 = st.columns(2)
+    with ch1:
+        st.plotly_chart(comp_fig, use_container_width=True)
+    with ch2:
+        st.plotly_chart(save_fig, use_container_width=True)
+
+    # ── Summary Table ─────────────────────────────────────────────────────────
+    st.subheader("📋 ตารางสรุป")
+    tbl_rows = []
+    for sc in scenarios:
+        tbl_rows.append({
+            "Scenario":        sc["label"],
+            "Solar (kWp)":     f"{sc['solar_kwp']:,}",
+            "Solar (MW)":      f"{sc['solar_mw']:.3f}",
+            "BESS (kWh)":      f"{sc['bess_kwh']:,}",
+            "BESS (MWh)":      f"{sc['bess_mwh']:.2f}",
+            "Solar:BESS":      f"1 : {sc['bess_kwh']/sc['solar_kwp']:.0f}" if sc["solar_kwp"] else "—",
+            "Total CAPEX":     fmt_thb(sc["total_capex"]),
+            "Saving Y1 (est)": fmt_thb(sc["total_save_yr"]),
+            "Payback (ปี)":    f"{sc['simple_pb']:.1f}" if sc["simple_pb"] else ">30",
+            "BOI CIT Cap":     fmt_thb(sc["boi_cap"]),
+        })
+    st.dataframe(pd.DataFrame(tbl_rows).set_index("Scenario"), use_container_width=True)
+
+    st.divider()
+
+    # ── How-to-use ────────────────────────────────────────────────────────────
+    st.subheader("📌 วิธีใช้ค่าที่แนะนำ")
+    st.markdown(
+        "1. เลือก Scenario ที่เหมาะสม (แนะนำ **Moderate** สำหรับ ROI ดีและความเสี่ยงต่ำ)\n"
+        "2. ไปที่แท็บ **☀️ Solar+BESS Bundle**\n"
+        "3. กรอก Solar kWp และ BESS kWh จากตารางด้านบน\n"
+        "4. ปรับ BOI ๓/๒๕๖๘ ตาม Solar MW ที่ติดตั้งจริง\n\n"
+        "⚠️ **หมายเหตุ:** การประเมินนี้เป็นค่าเบื้องต้น (ballpark) สมมติ load profile คงที่\n"
+        "ในโครงการจริงควรทำ load profile analysis แยกช่วงเวลา (15-min interval data) เพื่อความแม่นยำ"
+    )
+
+    with st.expander("🔍 รายละเอียดสูตรคำนวณ"):
+        st.markdown(f"""
+**โครงสร้าง TOU ที่ใช้คำนวณ (ไทย Mon-Fri):**
+
+| ช่วงเวลา | ประเภท | สัดส่วนของ On-Peak |
+|---|---|---|
+| 09:00–17:00 | ☀️ On-Peak + Solar | 8/13 = **{8/13*100:.1f}%** |
+| 17:00–22:00 | 🔋 On-Peak เย็น (ต้องใช้ BESS) | 5/13 = **{5/13*100:.1f}%** |
+| 22:00–09:00 | ⚡ Off-Peak (ชาร์จ BESS ราคาถูก) | — |
+
+**Solar kWp = (On-Peak kWh/ปี × {8/13:.3f} × Coverage%) ÷ (8,760h × CUF)**
+
+**BESS kWh = max ของ:**
+- (A) On-Peak kWh/วัน × {5/13:.3f} × Coverage% ÷ RTE  → *(เก็บพอใช้ช่วงเย็น)*
+- (B) Peak Demand kW × Battery Duration hr  → *(grid arb capacity)*
+- (C) Solar kWp × 4  → *(ratio 1:4 rule of thumb ตลาดไทย)*
+
+**Saving estimate (rough, Y1):**
+- Solar saving = Solar target kWh × On-Peak rate × 70% realization
+- BESS saving = BESS kWh × RTE × {sz_working_days} วัน × Arb Margin × 70% realization
+- Arb Margin = {on_peak_y1:.4f} − {off_peak_y1:.4f}/{rte:.2f} = **{on_peak_y1 - off_peak_y1/rte:.4f} THB/kWh**
+        """)
+
+    # ── Custom sizing ─────────────────────────────────────────────────────────
+    st.divider()
+    st.subheader("🔧 ลองปรับขนาดเองแล้วดูผลประมาณการ")
+    cz1, cz2 = st.columns(2)
+    with cz1:
+        custom_solar_kwp = st.number_input(
+            "Solar PV ที่ต้องการ (kWp)", min_value=10, max_value=50000,
+            value=int(scenarios[1]["solar_kwp"]), step=10, key="cz_solar"
+        )
+    with cz2:
+        custom_bess_kwh = st.number_input(
+            "BESS ที่ต้องการ (kWh)", min_value=100, max_value=100000,
+            value=int(scenarios[1]["bess_kwh"]), step=100, key="cz_bess"
+        )
+
+    cz_solar_mw = custom_solar_kwp / 1000
+    cz_bess_mwh = custom_bess_kwh / 1000
+    cz_solar_cap = cz_solar_mw * sz_solar_capex
+    cz_bess_cap  = cz_bess_mwh * sz_bess_capex
+    cz_total_cap = cz_solar_cap + cz_bess_cap
+    cz_solar_kwh_yr = custom_solar_kwp * 8760 * sz_cuf * (8/13)   # daytime on-peak gen
+    cz_solar_save   = cz_solar_kwh_yr * on_peak_y1 * 0.70
+    cz_bess_out     = custom_bess_kwh * rte * sz_working_days
+    cz_arb          = max(on_peak_y1 - off_peak_y1 / rte, 0)
+    cz_bess_save    = cz_bess_out * cz_arb * 0.70
+    cz_total_save   = cz_solar_save + cz_bess_save
+    cz_pb           = cz_total_cap / cz_total_save if cz_total_save > 0 else None
+    cz_boi_eligible = min(cz_bess_cap, 12_000_000 * cz_solar_mw)
+    cz_boi_cap      = cz_boi_eligible * 0.50
+
+    r1, r2, r3, r4, r5, r6 = st.columns(6)
+    r1.metric("Solar (MW)",      f"{cz_solar_mw:.3f}")
+    r2.metric("BESS (MWh)",      f"{cz_bess_mwh:.2f}")
+    r3.metric("Total CAPEX",     fmt_thb(cz_total_cap))
+    r4.metric("Saving Y1 (est)", fmt_thb(cz_total_save))
+    r5.metric("Simple Payback",  f"~{cz_pb:.1f} ปี" if cz_pb else ">30Y")
+    r6.metric("BOI CIT Cap",     fmt_thb(cz_boi_cap))
+
+    # Coverage check
+    cz_on_peak_coverage = cz_solar_kwh_yr / max(_on_peak_yr * (8/13), 1)
+    cz_ratio = custom_bess_kwh / max(custom_solar_kwp, 1)
+    st.caption(
+        f"Solar coverage of daytime on-peak: **{cz_on_peak_coverage*100:.1f}%** | "
+        f"Solar:BESS ratio: **1 : {cz_ratio:.0f}** kWp:kWh | "
+        f"On-peak coverage % from BOI MW rule: **{cz_boi_eligible/max(cz_bess_cap,1)*100:.0f}%** eligible"
+    )

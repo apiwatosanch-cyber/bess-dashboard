@@ -519,9 +519,12 @@ def recommend_sizing(
 
     bess_capex = bess_mwh * bess_capex_per_mwh
 
-    # BESS savings (v14: 2 cycles/day × 247d × spread × 70% realization)
-    spread      = on_peak_rate - off_peak_rate / rte
-    bess_arb_save  = bess_mwh * max(spread, 0) * working_days * 2 * 0.70  # 2 cycles
+    # BESS savings (v15: conditional cycles — 2 if Solar present, 1 if pure arb)
+    # Thai TOU = 1 on-peak window (09-22h) → pure grid arb max = 1 cycle/day
+    # Solar enables Cycle 1 (Solar→Evening free charge) + Cycle 2 (Grid OP→Morning)
+    spread         = on_peak_rate - off_peak_rate / rte
+    arb_cycles     = 2 if solar_mw > 0 else 1
+    bess_arb_save  = bess_mwh * max(spread, 0) * working_days * arb_cycles * 0.70
     demand_kw_cut  = bess_mw * 1000 * demand_reduction_target
     demand_save    = demand_kw_cut * demand_rate_per_kw_mo * 12 * 0.70
     bess_total_save = bess_arb_save + demand_save
@@ -628,7 +631,12 @@ with st.sidebar:
 
     st.divider()
     st.subheader("☀️ 2-Cycle Mode")
-    st.caption("Cycle 1: Solar → BESS → ปล่อย 18-22 น. (margin = on-peak เต็ม)\nCycle 2: Grid off-peak → BESS → ปล่อยเช้า (margin = spread)")
+    st.caption(
+        "Thai TOU = 1 on-peak window (09-22h) → **Pure Grid Arb max = 1 cycle/day**\n\n"
+        "Solar unlocks Cycle 1 (free charge) → รวมกับ Grid Cycle = 2 cycles/day\n\n"
+        "Cycle 1: Solar 09-16h → BESS → discharge 16-22h (margin = Peak, ไม่มีต้นทุนชาร์จ)\n"
+        "Cycle 2: Grid OP 22-09h → BESS → discharge morning 09-11h (margin = Spread)"
+    )
     dual_cycle = st.toggle("เปิด 2-Cycle (Solar + Grid Arb)", value=False)
     if dual_cycle:
         solar_days        = st.number_input("วันที่มีแดดพอชาร์จ BESS/ปี", min_value=200, max_value=365, value=310)
@@ -1152,8 +1160,14 @@ with tab5:
                                     help="ชาร์จจาก Grid off-peak → ปล่อยช่วงเช้า on-peak")
     with gc2:
         st.info(
-            f"Solar Cycle: **{sb_solar_bess_pct*100:.0f}%** ของ Solar output → BESS → ปล่อย 17-22h (margin = Peak)\n\n"
-            f"Grid Cycle: **{sb_grid_cycles}** cycle/day × 247 วัน → ปล่อยช้าก on-peak (margin = Spread)"
+            "**Cycle 1 — Solar-Charged** (requires Solar > 0)\n\n"
+            f"Solar charge 09-16h → BESS → discharge 16-22h\n"
+            f"Profit = Peak − Export/RTE ≈ Peak rate (free charge)\n\n"
+            "**Cycle 2 — Grid OP-Charged**\n\n"
+            f"Grid off-peak 22-09h → BESS → discharge morning 09-11h\n"
+            "Profit = Peak − OP/RTE = Spread margin\n\n"
+            "⚠️ Thai TOU (1 window/day) → **pure grid arb max = 1 cy/day**\n"
+            "Solar unlocks the 2nd cycle."
         )
 
     st.divider()
@@ -1550,8 +1564,10 @@ with tab6:
         b3.metric("Duration", f"{r['bess_hr']} hr")
         b4, b5, b6 = st.columns(3)
         b4.metric("BESS CAPEX", fmt_thb(r["bess_capex"]))
+        _arb_cyc = 2 if r["solar_mw"] > 0 else 1
         b5.metric("Arb Save/ปี (est)", fmt_thb(r["bess_arb_save"]),
-                   help=f"MWh × {sz_working_days}d × 2cycles × spread × 70% realization")
+                   help=f"MWh × {sz_working_days}d × {_arb_cyc} cycle{'s' if _arb_cyc>1 else ''}/day × spread × 70%"
+                        + (" (Solar enables 2nd cycle)" if _arb_cyc == 2 else " (pure grid arb = 1 cycle max)"))
         b6.metric("Demand Save/ปี (est)", fmt_thb(r["demand_save"]),
                    help=f"{r['demand_kw_cut']:.0f} kW shaved × 74.14 × 12 × 70%")
         st.info(
@@ -1626,9 +1642,11 @@ with tab6:
     cz_bess_cap   = custom_bess_mwh * sz_bess_capex
     cz_total_cap  = cz_solar_cap + cz_bess_cap
     cz_solar_kwh  = cz_solar_mw * 1000 * sz_cuf * 8760
-    cz_solar_save = cz_solar_kwh * (0.85 * on_peak_y1 + 0.15 * 2.2)
+    cz_solar_save = cz_solar_kwh * on_peak_y1  # Zero Export: 100% offset at on-peak rate
     cz_spread     = max(on_peak_y1 - off_peak_y1 / rte, 0)
-    cz_bess_save  = custom_bess_mwh * cz_spread * sz_working_days * 2 * 0.70
+    # v15: 2 cycles only if Solar present (Solar enables Cycle 1), else 1 cycle pure arb
+    cz_arb_cycles = 2 if cz_solar_mw > 0 else 1
+    cz_bess_save  = custom_bess_mwh * cz_spread * sz_working_days * cz_arb_cycles * 0.70
     cz_dem_save   = (cz_solar_mw * 1000 * sz_dem_red) * 74.14 * 12 * 0.70
     cz_total_save = cz_solar_save + cz_bess_save + cz_dem_save
     cz_pb_no_boi  = cz_total_cap / cz_total_save if cz_total_save > 0 else None
@@ -1666,7 +1684,8 @@ with tab6:
 
 **BESS sizing:** max(Peak shaving={r['bess_mw_from_peak']:.3f}MW, Solar shift={r['bess_mw_from_solar']:.3f}MW) → round↑0.25
 
-**BESS savings (2 cycles):** MWh × spread × {sz_working_days}d × 2 cycles × 70%
+**BESS savings ({_arb_cyc} cycle/day):** MWh × spread × {sz_working_days}d × {_arb_cyc} cy × 70%
+{"Solar present → 2 cycles (Cycle1: Solar→Evening, Cycle2: Grid→Morning)" if _arb_cyc==2 else "No Solar → 1 cycle max (Thai TOU single on-peak window)"}
 Arb Spread = {on_peak_y1:.4f} − {off_peak_y1:.4f}/{rte:.2f} = **{arb_margin_val:.4f} THB/kWh**
 
 **BOI Tax Shield:** min(BESS CAPEX, 12M × Solar MW) × 50% × 20% CIT

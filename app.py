@@ -757,9 +757,10 @@ with st.sidebar:
 st.title("⚡ BESS Arbitrage Dashboard")
 st.caption(f"**{selected_product}** · {result['cap_kwh']:,} kWh · {n_units} unit(s) · อัปเดตแบบ Real-time")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊 Dashboard", "📋 Cash Flow ตาราง", "🔄 เปรียบเทียบ 4 Products",
-    "📄 Bill Analysis", "☀️ Solar+BESS Bundle", "📐 ประเมินขนาดระบบ"
+    "📄 Bill Analysis", "☀️ Solar+BESS Bundle", "📐 ประเมินขนาดระบบ",
+    "🤝 PPA / นักลงทุน"
 ])
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1690,3 +1691,315 @@ Arb Spread = {on_peak_y1:.4f} − {off_peak_y1:.4f}/{rte:.2f} = **{arb_margin_va
 
 **BOI Tax Shield:** min(BESS CAPEX, 12M × Solar MW) × 50% × 20% CIT
         """)
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TAB 7 — PPA / นักลงทุน (v16)
+# ──────────────────────────────────────────────────────────────────────────────
+with tab7:
+    st.subheader("🤝 PPA / นักลงทุน — รูปแบบ 'ลูกค้าไม่ต้องลงทุนเอง'")
+
+    # ── อธิบาย PPA ──────────────────────────────────────────────────────────
+    with st.expander("📖 PPA คืออะไร? กดเพื่ออ่านคำอธิบาย", expanded=True):
+        col_ea, col_eb = st.columns(2)
+        with col_ea:
+            st.markdown("""
+**PPA = Power Purchase Agreement**
+สัญญาซื้อขายไฟฟ้าระยะยาว ระหว่างนักลงทุน (เจ้าของระบบ) กับลูกค้า
+
+**ลูกค้าได้อะไร?**
+- ✅ ไม่ต้องจ่ายค่าติดตั้ง — ลงทุน 0 บาท
+- ✅ ได้ใช้ไฟในราคา PPA ที่ตกลงกัน (ต่ำกว่าค่าไฟการไฟฟ้าปกติ)
+- ✅ นักลงทุนดูแลซ่อมบำรุงให้ตลอดสัญญา
+- 🔄 หมดสัญญา → รับโอนระบบฟรี หรือต่อสัญญาต่อ
+""")
+        with col_eb:
+            st.markdown("""
+**นักลงทุนได้อะไร?**
+- 💰 ลงทุน CAPEX (Solar+BESS) แล้วเป็นเจ้าของระบบ
+- 📈 รับรายได้จากค่า PPA ทุกเดือนตลอดอายุสัญญา
+- 🏛️ ใช้สิทธิ BOI ๓/๒๕๖๘ ลดภาษีได้ (ถ้ามี Solar)
+- 📊 Target IRR ทั่วไป 10–18% ขึ้นอยู่กับ PPA rate ที่ตกลงกัน
+
+**3 รูปแบบ PPA ที่ใช้บ่อย:**
+- 🅐 Fixed Rate — ราคาเดียวทุก kWh (ง่ายสุด)
+- 🅑 Tiered ★ — แยก Solar rate / BESS rate / Demand (แนะนำ)
+- 🅒 Shared Savings — แบ่ง % ของค่าไฟที่ลูกค้าประหยัดได้
+""")
+
+    st.divider()
+
+    # ── Section 1: ระบบที่ติดตั้ง ────────────────────────────────────────────
+    st.markdown("### ⚙️ Section 1 — ระบบที่ติดตั้ง")
+    st.caption("กรอกขนาดระบบที่จะติดตั้ง — ใช้คำนวณรายได้ PPA")
+    s1, s2, s3, s4 = st.columns(4)
+    with s1:
+        ppa_sol_kwp = st.number_input("Solar PV (kWp)", 0, 20000, 250, 50, key="ppa_sol",
+                                       help="0 = ติดเฉพาะ BESS ไม่มี Solar")
+    with s2:
+        ppa_sol_cuf = st.slider("CUF Solar (%)", 10, 22, 16, key="ppa_cuf",
+                                 help="Capacity Utilization Factor — ประสิทธิภาพแสงแดดเฉลี่ย") / 100
+    with s3:
+        ppa_bess_kwh = st.number_input("BESS (kWh)", 100, 100000, 1000, 100, key="ppa_bess",
+                                        help="ความจุแบตเตอรี่ รวมทุก Unit")
+    with s4:
+        ppa_demand_kw = st.number_input("Demand ที่ลด (kW)", 0, 10000, 0, 50, key="ppa_dkw",
+                                         help="kW ของ Max Demand ที่ BESS ช่วยตัดได้")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        ppa_sol_capex = st.number_input("Solar CAPEX (THB/MW)", value=20_000_000, step=1_000_000,
+                                         key="ppa_sc", format="%d")
+    with c2:
+        ppa_bess_capex = st.number_input("BESS CAPEX (THB/MWh)", value=6_000_000, step=500_000,
+                                          key="ppa_bc", format="%d")
+    with c3:
+        ppa_demand_rate = st.number_input("Demand Rate (THB/kW/เดือน)", value=74.14, step=1.0,
+                                           key="ppa_dr", help="จากบิลลูกค้า — MEA/PEA ประมาณ 74-100 THB/kW/เดือน")
+    with c4:
+        ppa_cust_bill = st.number_input("บิลค่าไฟลูกค้า (THB/ปี)", value=3_000_000, step=100_000,
+                                         key="ppa_bill", format="%d",
+                                         help="ค่าไฟรวม Demand + Energy ต่อปีก่อนติดตั้งระบบ")
+
+    # ── Derived system values ─────────────────────────────────────────────────
+    ppa_sol_mw      = ppa_sol_kwp / 1000
+    ppa_bess_mwh    = ppa_bess_kwh / 1000
+    ppa_total_capex = ppa_sol_mw * ppa_sol_capex + ppa_bess_mwh * ppa_bess_capex
+
+    ppa_sol_kwh_y1  = ppa_sol_mw * 1000 * ppa_sol_cuf * 8760  # kWh/yr
+    # BESS output: Solar Cycle (40% of solar → BESS → out) + Grid Cycle (capacity × rte × days)
+    if ppa_sol_mw > 0:
+        ppa_bess_solar_out = ppa_sol_kwh_y1 * 0.40 * rte
+        ppa_bess_grid_out  = ppa_bess_kwh * rte * 1.0 * working_days
+        ppa_bess_out_y1    = ppa_bess_solar_out + ppa_bess_grid_out
+    else:
+        ppa_bess_out_y1    = ppa_bess_kwh * rte * cycles_day * working_days  # 1 cycle pure arb
+    ppa_arb_spread  = max(on_peak_y1 - off_peak_y1 / rte, 0)
+
+    # EPC save (ถ้าลูกค้าซื้อเองจะประหยัดเท่าไหร่ — ใช้สำหรับ Model C)
+    ppa_epc_solar   = ppa_sol_kwh_y1 * 0.60 * on_peak_y1          # Direct load offset
+    ppa_epc_bess    = ppa_bess_out_y1 * ppa_arb_spread * 0.90
+    ppa_epc_demand  = ppa_demand_kw * ppa_demand_rate * 12
+    ppa_epc_save_y1 = ppa_epc_solar + ppa_epc_bess + ppa_epc_demand
+
+    # Info box: derived system specs
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Total CAPEX", fmt_thb(ppa_total_capex))
+    d2.metric("Solar Y1 (kWh)", f"{ppa_sol_kwh_y1:,.0f}")
+    d3.metric("BESS Out Y1 (kWh)", f"{ppa_bess_out_y1:,.0f}")
+    d4.metric("EPC Save Y1 (est)", fmt_thb(ppa_epc_save_y1),
+              help="ค่าไฟที่ลูกค้าจะประหยัดถ้าซื้อระบบเอง — ใช้คำนวณ Model C")
+
+    st.divider()
+
+    # ── Section 2: PPA Parameters ─────────────────────────────────────────────
+    st.markdown("### 💰 Section 2 — PPA Pricing")
+    st.caption("ตั้งราคา PPA ที่จะเสนอลูกค้า — ต้องต่ำกว่าค่าไฟปกติเพื่อให้ลูกค้าสนใจ")
+    p1, p2, p3, p4 = st.columns(4)
+    with p1:
+        ppa_sol_rate = st.number_input("PPA Solar Rate (THB/kWh)", value=3.20, step=0.10,
+                                        key="ppa_sr",
+                                        help=f"ราคาขายไฟจาก Solar (ค่าไฟ on-peak ปัจจุบัน = {on_peak_y1:.4f} THB/kWh)")
+    with p2:
+        ppa_bess_rate = st.number_input("PPA BESS Rate (THB/kWh)", value=3.80, step=0.10,
+                                         key="ppa_br",
+                                         help="ราคาขายไฟจาก BESS — มักสูงกว่า Solar เพราะ BESS discharge ช่วงราคาสูง")
+    with p3:
+        ppa_esc = st.slider("PPA Escalation (%/ปี)", 0.0, 5.0, 2.5, 0.5, key="ppa_esc",
+                             help="อัตราขึ้นราคา PPA ต่อปี — ทำให้รายได้นักลงทุนเพิ่มขึ้นตามเวลา") / 100
+    with p4:
+        ppa_term = st.number_input("PPA Term (ปี)", 5, 25, 15, key="ppa_t",
+                                    help="ระยะเวลาสัญญา PPA — ยิ่งนานยิ่ง IRR ดี แต่ลูกค้า lock-in นานขึ้น")
+
+    p5, p6, p7 = st.columns(3)
+    with p5:
+        ppa_dem_share = st.slider("Investor Demand Share (%)", 0, 100, 80, 5, key="ppa_ds",
+                                   help="% ของ Demand Saving ที่นักลงทุนได้รับ (Model B เท่านั้น)") / 100
+    with p6:
+        ppa_shared_pct = st.slider("Shared Savings % (Model C)", 0, 100, 80, 5, key="ppa_ss",
+                                    help="% ของ EPC Saving ทั้งหมดที่นักลงทุนได้ (Model C เท่านั้น)") / 100
+    with p7:
+        ppa_om_pct = st.slider("OM + Insurance (%/ปี)", 0.5, 3.0, 1.0, 0.1, key="ppa_om",
+                                help="ค่าดูแลรักษาต่อปี (% ของ CAPEX) — นักลงทุนต้องจ่ายเอง") / 100
+
+    # ── Section 3: เลือก PPA Model ───────────────────────────────────────────
+    st.divider()
+    st.markdown("### 🔀 Section 3 — เลือก PPA Model")
+
+    ppa_model_sel = st.radio(
+        "PPA Model",
+        ["A — Fixed Rate (ราคาเดียว)", "B — Tiered ★ (แยก Solar/BESS/Demand)", "C — Shared Savings (แบ่ง % จากส่วนลด)"],
+        index=1, horizontal=True, key="ppa_model"
+    )
+
+    # Model revenue Y1
+    rev_a = (ppa_sol_kwh_y1 + ppa_bess_out_y1) * ppa_sol_rate * 0.9
+    rev_b = (ppa_sol_kwh_y1 * ppa_sol_rate * 0.9
+             + ppa_bess_out_y1 * ppa_bess_rate
+             + ppa_demand_kw * ppa_demand_rate * 12 * ppa_dem_share)
+    rev_c = ppa_epc_save_y1 * ppa_shared_pct
+
+    model_map = {
+        "A — Fixed Rate (ราคาเดียว)": ("A", rev_a,
+            f"Revenue = ({ppa_sol_kwh_y1:,.0f} + {ppa_bess_out_y1:,.0f}) kWh × {ppa_sol_rate:.2f} × 90% availability"),
+        "B — Tiered ★ (แยก Solar/BESS/Demand)": ("B", rev_b,
+            f"Revenue = Solar {ppa_sol_kwh_y1:,.0f} kWh × {ppa_sol_rate:.2f}×90%"
+            f" + BESS {ppa_bess_out_y1:,.0f} kWh × {ppa_bess_rate:.2f}"
+            f" + Demand {ppa_demand_kw:,.0f} kW × {ppa_demand_rate:.2f} × 12 × {ppa_dem_share*100:.0f}%"),
+        "C — Shared Savings (แบ่ง % จากส่วนลด)": ("C", rev_c,
+            f"Revenue = EPC Save {fmt_thb(ppa_epc_save_y1)} × {ppa_shared_pct*100:.0f}% Investor Share"),
+    }
+    model_code, ppa_rev_y1, formula_note = model_map[ppa_model_sel]
+    customer_save_y1 = ppa_epc_save_y1 - ppa_rev_y1
+    customer_save_pct = customer_save_y1 / max(ppa_cust_bill, 1)
+
+    # Show all 3 model revenues side-by-side
+    ma, mb, mc = st.columns(3)
+    ma.metric("Model A — Y1 Revenue", fmt_thb(rev_a),
+              delta="Selected ✓" if model_code == "A" else None,
+              help="(Solar kWh + BESS kWh) × Solar Rate × 90%")
+    mb.metric("Model B — Y1 Revenue ★", fmt_thb(rev_b),
+              delta="Selected ✓" if model_code == "B" else None,
+              help="Solar × Solar Rate + BESS × BESS Rate + Demand Saving × Share%")
+    mc.metric("Model C — Y1 Revenue", fmt_thb(rev_c),
+              delta="Selected ✓" if model_code == "C" else None,
+              help=f"EPC Save × {ppa_shared_pct*100:.0f}% Shared Savings")
+
+    st.caption(f"📐 สูตรที่ใช้ (Model {model_code}): {formula_note}")
+
+    st.divider()
+
+    # ── Section 4: 20Y Investor Cash Flow ────────────────────────────────────
+    st.markdown("### 📈 Section 4 — Investor Cash Flow 20 ปี")
+    st.caption("นักลงทุนลงทุน CAPEX ปีที่ 0 แล้วรับรายได้ PPA ทุกปี — IRR และ Payback คือตัวชี้วัดหลัก")
+
+    ppa_om_annual = ppa_total_capex * ppa_om_pct
+    # Augmentation at Y11: partial BESS capacity restoration ~ 20% of BESS CAPEX
+    ppa_augment_y11 = ppa_bess_mwh * ppa_bess_capex * 0.20
+
+    ppa_cf_rows = []
+    ppa_cfs = [-ppa_total_capex]
+    ppa_cum = -ppa_total_capex
+    for y in range(1, ppa_term + 1):
+        rev_y  = ppa_rev_y1 * (1 + ppa_esc) ** (y - 1)
+        om_y   = -ppa_om_annual
+        aug_y  = -ppa_augment_y11 if y == 11 else 0.0
+        pre_cf = rev_y + om_y + aug_y
+        net_cf = pre_cf * (1 - cit)          # after-CIT (same as Excel ×0.8 at 20% CIT)
+        ppa_cum += net_cf
+        ppa_cfs.append(net_cf)
+        ppa_cf_rows.append({
+            "Year": y,
+            "Revenue (THB)": rev_y,
+            "OM Cost (THB)": om_y,
+            "Augment Y11 (THB)": aug_y,
+            "Net CF after-tax (THB)": net_cf,
+            "Cumulative CF (THB)": ppa_cum,
+        })
+
+    ppa_cf_df = pd.DataFrame(ppa_cf_rows)
+    ppa_irr    = safe_irr(ppa_cfs)
+    ppa_npv    = sum(c / (1 + wacc) ** i for i, c in enumerate(ppa_cfs))
+    ppa_pb_idx = next((r["Year"] for _, r in ppa_cf_df.iterrows() if r["Cumulative CF (THB)"] >= 0), None)
+    if ppa_pb_idx and ppa_pb_idx > 1:
+        prev_cum = float(ppa_cf_df[ppa_cf_df["Year"] == ppa_pb_idx - 1]["Cumulative CF (THB)"].values[0])
+        curr_cum = float(ppa_cf_df[ppa_cf_df["Year"] == ppa_pb_idx]["Cumulative CF (THB)"].values[0])
+        ppa_pb = (ppa_pb_idx - 1) + (-prev_cum / (curr_cum - prev_cum))
+    else:
+        ppa_pb = ppa_pb_idx
+
+    # Investor KPIs
+    ik1, ik2, ik3, ik4, ik5 = st.columns(5)
+    ik1.metric("CAPEX ที่ลงทุน", fmt_thb(ppa_total_capex))
+    ik2.metric(f"IRR {ppa_term}Y (นักลงทุน)", f"{ppa_irr*100:.1f}%" if ppa_irr else "N/A",
+               help="Internal Rate of Return ของนักลงทุน — target ทั่วไป ≥ 10%")
+    ik3.metric(f"NPV @ {wacc*100:.0f}%", fmt_thb(ppa_npv),
+               help="Net Present Value — บวก = โครงการสร้างมูลค่า")
+    ik4.metric("Payback (ปี)", f"{ppa_pb:.1f}" if ppa_pb else f">{ppa_term}Y",
+               help="ปีที่คืนทุน")
+    ik5.metric(f"Cum CF ปีที่ {ppa_term}", fmt_thb(ppa_cum))
+
+    # Chart: Cumulative CF
+    fig_ppa = go.Figure()
+    fig_ppa.add_trace(go.Bar(
+        x=ppa_cf_df["Year"], y=ppa_cf_df["Net CF after-tax (THB)"],
+        name="Net CF/ปี", marker_color="steelblue", opacity=0.7
+    ))
+    fig_ppa.add_trace(go.Scatter(
+        x=ppa_cf_df["Year"], y=ppa_cf_df["Cumulative CF (THB)"],
+        name="Cumulative CF", line=dict(color="orange", width=2.5), mode="lines+markers"
+    ))
+    fig_ppa.add_hline(y=0, line_dash="dash", line_color="red", annotation_text="Breakeven")
+    fig_ppa.update_layout(
+        title=f"Investor Cash Flow {ppa_term}Y — Model {model_code}",
+        xaxis_title="Year", yaxis_title="THB",
+        legend=dict(orientation="h", y=1.08), height=380
+    )
+    st.plotly_chart(fig_ppa, use_container_width=True)
+
+    # Detailed table (collapsible)
+    with st.expander("📋 ดูตาราง CF รายปี"):
+        disp_df = ppa_cf_df.copy()
+        for col in ["Revenue (THB)", "OM Cost (THB)", "Augment Y11 (THB)", "Net CF after-tax (THB)", "Cumulative CF (THB)"]:
+            disp_df[col] = disp_df[col].apply(lambda x: f"฿{x:,.0f}")
+        st.dataframe(disp_df, use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Section 5: Customer View ──────────────────────────────────────────────
+    st.markdown("### 👤 Section 5 — Customer View (มุมมองลูกค้า)")
+    st.caption("ลูกค้าจ่าย PPA rate แทนค่าไฟเต็ม → ประหยัดได้เท่าไหร่?")
+
+    ck1, ck2, ck3, ck4 = st.columns(4)
+    ck1.metric("บิลปัจจุบัน/ปี", fmt_thb(ppa_cust_bill))
+    ck2.metric("ลูกค้าประหยัด Y1", fmt_thb(customer_save_y1),
+               help="= EPC Save − PPA Revenue ที่จ่ายให้นักลงทุน")
+    ck3.metric("ลด % ของบิลไฟ", f"{customer_save_pct*100:.1f}%",
+               delta="ดีมาก" if customer_save_pct >= 0.15 else ("พอใช้" if customer_save_pct >= 0.08 else "ต่ำ"))
+    ppa_cust_save_20y = customer_save_y1 * ((1 + ppa_esc) ** ppa_term - 1) / ppa_esc if ppa_esc > 0 else customer_save_y1 * ppa_term
+    ck4.metric(f"ลูกค้าประหยัดรวม {ppa_term}Y", fmt_thb(ppa_cust_save_20y))
+
+    st.info(
+        f"💡 ลูกค้าจ่ายเงินลงทุน: **฿0** — ไม่มี upfront cost\n\n"
+        f"เทียบ: ถ้าซื้อระบบเอง ต้องจ่าย **{fmt_thb(ppa_total_capex)}** "
+        f"(Payback ~{ppa_total_capex/max(ppa_epc_save_y1,1):.1f} ปี)"
+    )
+
+    # Side-by-side: Investor vs Customer
+    st.markdown("#### เปรียบเทียบ Investor vs Customer")
+    cmp_data = {
+        "มุมมอง": ["นักลงทุน", "ลูกค้า"],
+        "เงินลงทุน": [fmt_thb(ppa_total_capex), "฿0"],
+        "รายได้/ประหยัด Y1": [fmt_thb(ppa_rev_y1), fmt_thb(customer_save_y1)],
+        f"รวม {ppa_term}Y": [fmt_thb(sum(ppa_cfs[1:])), fmt_thb(ppa_cust_save_20y)],
+        "IRR / ลด%บิล": [f"{ppa_irr*100:.1f}%" if ppa_irr else "N/A", f"{customer_save_pct*100:.1f}%"],
+    }
+    st.dataframe(pd.DataFrame(cmp_data), use_container_width=True, hide_index=True)
+
+    st.divider()
+
+    # ── Section 6: Pitch Messages ─────────────────────────────────────────────
+    st.markdown("### 🎯 Section 6 — Pitch Messages (auto-generated)")
+    st.caption("คัดลอกข้อความด้านล่างไปใช้กับลูกค้าหรือนักลงทุนได้เลย")
+
+    inv_pitch = (
+        f"[Investor] Model {model_code} | CAPEX {fmt_thb(ppa_total_capex)} | "
+        f"Y1 Revenue {fmt_thb(ppa_rev_y1)} | IRR {ppa_irr*100:.1f}% | "
+        f"Payback {ppa_pb:.1f}Y | {ppa_term}Y PPA"
+    ) if ppa_irr else f"[Investor] Model {model_code} — ปรับ PPA rate เพิ่มเพื่อให้ IRR เป็นบวก"
+
+    cust_pitch = (
+        f"[ลูกค้า] ลดค่าไฟ {customer_save_pct*100:.0f}% = ประหยัด {fmt_thb(customer_save_y1)}/ปี "
+        f"| รวม {ppa_term}Y ประหยัด {fmt_thb(ppa_cust_save_20y)} "
+        f"| ลงทุน ฿0 | นักลงทุนดูแลระบบให้ตลอด"
+    )
+
+    st.success(f"🏦 **Investor Pitch:** {inv_pitch}")
+    st.success(f"👤 **Customer Pitch:** {cust_pitch}")
+
+    # Sanity check warnings
+    if customer_save_y1 < 0:
+        st.warning("⚠️ PPA Revenue สูงกว่า EPC Save — ลูกค้าจะจ่ายแพงกว่าค่าไฟปกติ ลองลด PPA Rate ลง")
+    if ppa_irr and ppa_irr < 0.08:
+        st.warning("⚠️ IRR ต่ำกว่า 8% — ลองเพิ่ม PPA rate หรือลด CAPEX เพื่อให้ผลตอบแทนดีขึ้น")
+    if ppa_sol_mw == 0:
+        st.info("ℹ️ ไม่มี Solar → BESS ทำ pure Grid Arbitrage เท่านั้น (1 cycle/day) และไม่ได้สิทธิ BOI ๓/๒๕๖๘")

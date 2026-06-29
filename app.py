@@ -53,6 +53,12 @@ def calc_solar_bess(
     solar_bess_pct=0.40,     # Solar → BESS charge (ปล่อยช่วงเย็น 17-22h); direct+bess=100%
     grid_cycles_day=1.0,     # Grid OP-charged cycles/day (อาจเป็น 0 ถ้าไม่ charge จาก grid)
     working_days=247,        # วันที่ grid arb ทำได้ (จ-ศ − หยุดนักขัตฤกษ์)
+    # ── v17.3 Engineering assumptions ────────────────────────────────────────
+    solar_pr=0.82,           # Performance Ratio — ลดทอน soiling/shading/temp (IEC standard)
+    bess_avail=0.96,         # BESS Availability factor — uptime หักบำรุงรักษา
+    idc_pct=0.03,            # Interest During Construction 3% ของ Total CAPEX
+    use_irec=False,          # I-REC revenue (ปิดเป็น default — ไม่ใช่ Base Case)
+    irec_price=100.0,        # I-REC Price (THB/MWh)
 ):
     solar_mw  = solar_kwp / 1000
     bess_mwh  = bess_kwh  / 1000
@@ -60,10 +66,12 @@ def calc_solar_bess(
     solar_capex = solar_mw  * solar_capex_per_mw
     bess_capex  = bess_mwh  * bess_capex_per_mwh
     total_capex = solar_capex + bess_capex
+    idc_cost    = total_capex * idc_pct          # IDC 3% — ต้นทุนเงินกู้ระหว่างก่อสร้าง
+    total_capex_idc = total_capex + idc_cost     # CAPEX สำหรับคำนวณ OM + investment
 
-    annual_om        = total_capex * om_pct
+    annual_om        = total_capex_idc * om_pct
     bundled_om_total = annual_om * bundled_om_years
-    total_investment = total_capex + bundled_om_total
+    total_investment = total_capex_idc + bundled_om_total
 
     # BOI ๓/๒๕๖๘ — BESS + Solar bundle
     # Eligible cap = min(BESS CAPEX, 12,000,000 THB per MW of Solar PV)
@@ -81,7 +89,8 @@ def calc_solar_bess(
     cum_cf  = -total_investment
     cum_exempt = 0.0
 
-    solar_kwh_y1 = solar_mw * 8760 * solar_cuf * 1000   # kWh/year at Y1
+    # solar_pr: Performance Ratio (soiling, shading, temp losses) — IEC standard 0.82
+    solar_kwh_y1 = solar_mw * 8760 * solar_cuf * 1000 * solar_pr   # kWh/year at Y1
 
     for y in range(1, 31):
         sol_deg   = (1 - solar_deg_pct) ** (y - 1)
@@ -104,13 +113,13 @@ def calc_solar_bess(
         # BESS revenue แยก 2 cycles (v14: Solar Cycle + Grid OP Cycle):
         # Solar Cycle — ชาร์จฟรีจาก Solar, ปล่อย 17-22h on-peak
         #   Input: solar_bess_pct × solar_kwh → RTE → to load
-        solar_bess_in  = solar_kwh_y * solar_bess_pct          # kWh/yr into BESS from solar
-        solar_bess_out = solar_bess_in * rte * bess_deg        # kWh/yr delivered (RTE + deg)
-        bess_solar_rev = solar_bess_out * pk * realization_factor  # margin = pk (no charge cost)
+        solar_bess_in  = solar_kwh_y * solar_bess_pct                       # kWh/yr into BESS from solar
+        solar_bess_out = solar_bess_in * rte * bess_deg * bess_avail       # kWh/yr delivered (RTE + deg + avail)
+        bess_solar_rev = solar_bess_out * pk * realization_factor           # margin = pk (no charge cost)
 
         # Grid Cycle — ชาร์จ off-peak ราคาถูก, ปล่อย morning on-peak
-        arb_margin      = pk - (op / rte)                      # spread
-        bess_grid_out   = bess_kwh * (rte) * grid_cycles_day * working_days * bess_deg
+        arb_margin      = pk - (op / rte)                                   # spread
+        bess_grid_out   = bess_kwh * rte * bess_avail * grid_cycles_day * working_days * bess_deg
         bess_grid_rev   = bess_grid_out * max(arb_margin, 0) * realization_factor
 
         bess_arb  = bess_solar_rev + bess_grid_rev
@@ -118,8 +127,11 @@ def calc_solar_bess(
 
         demand_save  = demand_cut_kw * demand_rate_per_kw_mo * 12
 
+        # I-REC: Solar kWh × 90% eligible × price (THB/MWh → /1000)
+        irec_rev = solar_kwh_y * 0.90 * irec_price / 1000 if use_irec else 0.0
+
         om_cost = 0.0 if y <= bundled_om_years else annual_om
-        pre_tax = solar_save + bess_arb + demand_save - om_cost
+        pre_tax = solar_save + bess_arb + demand_save + irec_rev - om_cost
 
         full_cit = max(0.0, pre_tax * cit)
         if cum_exempt < boi_cap and y <= boi_years:
@@ -149,6 +161,7 @@ def calc_solar_bess(
             "BESS Grid Rev (THB)": bess_grid_rev,
             "BESS Arb (THB)": bess_arb,
             "Demand Save (THB)": demand_save,
+            "I-REC Rev (THB)": irec_rev,
             "OM Cost (THB)": om_cost,
             "Pre-Tax CF (THB)": pre_tax,
             "Full CIT (THB)": full_cit,
@@ -191,6 +204,7 @@ def calc_solar_bess(
         "total_investment": total_investment,
         "solar_capex": solar_capex,
         "bess_capex": bess_capex,
+        "idc_cost": idc_cost,
         "boi_cap": boi_cap,
         "annual_om": annual_om,
     }
@@ -488,8 +502,9 @@ def recommend_sizing(
     solar_mw = max(solar_mw, 0.001)
 
     solar_kwh_yr = solar_mw * 1000 * cuf * 8760
-    # Solar save: Zero Export — 100% offset ค่าไฟ on-peak rate ทั้งหมด
-    solar_save = solar_kwh_yr * on_peak_rate
+    # Solar save (Bill Sizer quick estimate): 85% offset on-peak + 15% export at 2.2 THB/kWh
+    # ตรงกับ Excel v17.3 B43: =B42*0.85*Peak + B42*0.15*2.2
+    solar_save = solar_kwh_yr * (0.85 * on_peak_rate + 0.15 * 2.2)
     solar_capex = solar_mw * solar_capex_per_mw
     solar_pb    = solar_capex / solar_save if solar_save > 0 else None
 
@@ -1119,8 +1134,12 @@ with tab5:
 
     with col_d:
         st.markdown("**🔌 Demand Charge**")
+        sb_tariff_type = st.radio("การไฟฟ้า", ["MEA (กฟน.)", "PEA (กฟภ.)"],
+                                   key="sb_tariff", horizontal=True,
+                                   help="MEA: 74.14 | PEA: 132.93 THB/kW/เดือน")
+        _default_dr = 74.14 if "MEA" in sb_tariff_type else 132.93
         sb_demand_cut = st.number_input("Demand Reduction (kW)", min_value=0, max_value=5000, value=250, step=10)
-        sb_demand_rate= st.number_input("Demand Rate (THB/kW/เดือน)", value=74.14, step=1.0, format="%.2f")
+        sb_demand_rate= st.number_input("Demand Rate (THB/kW/เดือน)", value=_default_dr, step=1.0, format="%.2f")
 
     with col_r:
         st.markdown("**🏛️ BOI ๓/๒๕๖๘ & ปัจจัยอื่น**")
@@ -1172,6 +1191,26 @@ with tab5:
         )
 
     st.divider()
+    st.markdown("**⚙️ Engineering Assumptions (v17.3)**")
+    eng1, eng2, eng3, eng4 = st.columns(4)
+    with eng1:
+        sb_solar_pr   = st.slider("Solar PR", 0.70, 1.00, 0.82, 0.01, key="sb_pr",
+                                   help="Performance Ratio — losses จาก soiling/shading/temp (มาตรฐาน IEC: 0.80-0.85)")
+    with eng2:
+        sb_bess_avail = st.slider("BESS Availability", 0.85, 1.00, 0.96, 0.01, key="sb_av",
+                                   help="Uptime factor หักบำรุงรักษา/shutdown (มาตรฐาน: 0.95-0.97)")
+    with eng3:
+        sb_idc_pct    = st.slider("IDC % of CAPEX", 0.0, 6.0, 3.0, 0.5, key="sb_idc",
+                                   help="Interest During Construction — ดอกเบี้ยระหว่างก่อสร้าง (v17.3: 3%)") / 100
+    with eng4:
+        sb_use_irec   = st.toggle("I-REC Revenue", value=False, key="sb_irec",
+                                   help="Solar kWh × 90% × I-REC Price — ปิดเป็น Default (ไม่ใช่ Base Case)")
+        sb_irec_price = 100.0
+        if sb_use_irec:
+            sb_irec_price = float(st.number_input("I-REC Price (THB/MWh)", value=100, step=10, key="sb_irec_px",
+                                                    help="ราคา I-REC ตลาด ~100-200 THB/MWh"))
+
+    st.divider()
     col_loan = st.container()
     with col_loan:
         st.markdown("**🏦 Financing (กู้เงิน)**")
@@ -1214,6 +1253,12 @@ with tab5:
         solar_bess_pct        = sb_solar_bess_pct,
         grid_cycles_day       = sb_grid_cycles,
         working_days          = working_days,
+        # v17.3 engineering assumptions
+        solar_pr              = sb_solar_pr,
+        bess_avail            = sb_bess_avail,
+        idc_pct               = sb_idc_pct,
+        use_irec              = sb_use_irec,
+        irec_price            = sb_irec_price,
     )
 
     # Loan overlay for Solar+BESS
@@ -1248,12 +1293,13 @@ with tab5:
         lb_payback = next((i+1 for i, v in enumerate(sb_loan_cum) if v >= 0), None)
         lk5.metric("Payback (กู้)", f"ปีที่ {lb_payback}" if lb_payback else ">30Y")
 
-    k6, k7, k8, k9 = st.columns(4)
+    k6, k7, k8, k9, k10 = st.columns(5)
     k6.metric("Total Investment", fmt_thb(sb_m["total_investment"]))
     k7.metric("Solar CAPEX", fmt_thb(sb_m["solar_capex"]))
     k8.metric("BESS CAPEX", fmt_thb(sb_m["bess_capex"]))
-    boi_label_sol = f"BOI Cap (50%) = {fmt_thb(sb_m['boi_cap'])}" if sb_use_boi else "ไม่ได้ขอ BOI"
-    k9.metric("BOI ๓/๒๕๖๘ CIT Cap", fmt_thb(sb_m["boi_cap"]) if sb_use_boi else "—")
+    k9.metric("IDC (3%)", fmt_thb(sb_m["idc_cost"]),
+               help=f"Interest During Construction = Total CAPEX × {sb_idc_pct*100:.1f}%")
+    k10.metric("BOI ๓/๒๕๖๘ CIT Cap", fmt_thb(sb_m["boi_cap"]) if sb_use_boi else "—")
 
     st.divider()
 
@@ -1268,15 +1314,24 @@ with tab5:
     rev_cols[2].metric("⚡ BESS Grid Cycle", fmt_thb(y1["BESS Grid Rev (THB)"]),
                         help="Grid Off-Peak → BESS → Morning On-Peak × Spread")
     rev_cols[3].metric("🔌 Demand Save", fmt_thb(y1["Demand Save (THB)"]))
-    total_gross = y1["Solar Save (THB)"] + y1["BESS Arb (THB)"] + y1["Demand Save (THB)"]
-    rev_cols[4].metric("✅ Total Gross Y1", fmt_thb(total_gross))
+    irec_y1 = y1["I-REC Rev (THB)"]
+    total_gross = y1["Solar Save (THB)"] + y1["BESS Arb (THB)"] + y1["Demand Save (THB)"] + irec_y1
+    rev_cols[4].metric("✅ Total Gross Y1", fmt_thb(total_gross),
+                        delta=f"+I-REC {fmt_thb(irec_y1)}" if sb_use_irec else None)
 
     # Revenue mix pie
+    pie_labels = ["Solar Saving", "BESS Arbitrage", "Demand Saving"]
+    pie_values = [y1["Solar Save (THB)"], y1["BESS Arb (THB)"], y1["Demand Save (THB)"]]
+    pie_colors = ["#ffd166", "#00b4d8", "#06d6a0"]
+    if sb_use_irec and irec_y1 > 0:
+        pie_labels.append("I-REC")
+        pie_values.append(irec_y1)
+        pie_colors.append("#a29bfe")
     pie_fig = go.Figure(go.Pie(
-        labels=["Solar Saving", "BESS Arbitrage", "Demand Saving"],
-        values=[y1["Solar Save (THB)"], y1["BESS Arb (THB)"], y1["Demand Save (THB)"]],
+        labels=pie_labels,
+        values=pie_values,
         hole=0.4,
-        marker_colors=["#ffd166","#00b4d8","#06d6a0"]
+        marker_colors=pie_colors
     ))
     pie_fig.update_layout(title="สัดส่วน Revenue Y1", height=320, margin=dict(l=0,r=0,t=40,b=0))
 
@@ -1417,7 +1472,7 @@ with tab6:
         sz_self_con = st.slider("Self-Consumption Target (%)", 70, 100, 90, 5, key="sz_sc_t") / 100
         sz_dem_red  = st.slider("Demand Reduction Target (%)", 10, 50, 30, 5, key="sz_dr") / 100
 
-    sz_b1, sz_b2, sz_b3, sz_b4 = st.columns(4)
+    sz_b1, sz_b2, sz_b3, sz_b4, sz_b5 = st.columns(5)
     with sz_b1: sz_cuf = st.slider("Solar CUF (%)", 12.0, 22.0, 16.0, 0.5, key="sz_cuf") / 100
     with sz_b2: sz_solar_capex = st.number_input("Solar CAPEX (THB/MW)", value=20_000_000,
                                                    step=500_000, format="%d", key="sz_sc2")
@@ -1427,6 +1482,11 @@ with tab6:
                                                    help="Turnkey AC ~10-12M/MWh (v14 default)")
     with sz_b4: sz_working_days = st.number_input("Working Days/ปี", min_value=220, max_value=262,
                                                    value=working_days, key="sz_wd")
+    with sz_b5:
+        sz_tariff_type = st.radio("ประเภทการไฟฟ้า", ["MEA (กฟน.)", "PEA (กฟภ.)"],
+                                   key="sz_tariff", help="MEA: 74.14 | PEA: 132.93 THB/kW/เดือน")
+        sz_demand_rate = 74.14 if "MEA" in sz_tariff_type else 132.93
+        st.caption(f"Demand Rate: **{sz_demand_rate:.2f}** THB/kW/เดือน")
 
     # ── SECTION 3-4: Bill Analysis ────────────────────────────────────────────
     st.divider()
@@ -1434,7 +1494,7 @@ with tab6:
     sz_on_off_ratio  = _on_peak_yr / max(_off_peak_yr, 1)
     sz_peak_avg_ratio = _max_kw_bill / max(sz_avg_kw_onpeak, 1)
     sz_energy_cost    = _on_peak_yr * on_peak_y1 + _off_peak_yr * off_peak_y1
-    sz_demand_cost_yr = _max_kw_bill * 74.14 * 12
+    sz_demand_cost_yr = _max_kw_bill * sz_demand_rate * 12
     sz_ft_est         = sz_energy_cost * 0.08
     sz_annual_bill    = sz_energy_cost + sz_demand_cost_yr + sz_ft_est
 
@@ -1483,7 +1543,7 @@ with tab6:
         peak_kw                 = _max_kw_bill,
         on_peak_rate            = on_peak_y1,
         off_peak_rate           = off_peak_y1,
-        demand_rate_per_kw_mo   = 74.14,
+        demand_rate_per_kw_mo   = sz_demand_rate,
         cuf                     = sz_cuf,
         working_days            = sz_working_days,
         rte                     = rte,
@@ -1570,7 +1630,7 @@ with tab6:
                    help=f"MWh × {sz_working_days}d × {_arb_cyc} cycle{'s' if _arb_cyc>1 else ''}/day × spread × 70%"
                         + (" (Solar enables 2nd cycle)" if _arb_cyc == 2 else " (pure grid arb = 1 cycle max)"))
         b6.metric("Demand Save/ปี (est)", fmt_thb(r["demand_save"]),
-                   help=f"{r['demand_kw_cut']:.0f} kW shaved × 74.14 × 12 × 70%")
+                   help=f"{r['demand_kw_cut']:.0f} kW shaved × {sz_demand_rate:.2f} × 12 × 70%")
         st.info(
             f"BESS MW from Peak Shaving: **{r['bess_mw_from_peak']:.3f} MW** "
             f"({_max_kw_bill:.0f} kW × {sz_dem_red*100:.0f}%)\n\n"
@@ -1643,12 +1703,13 @@ with tab6:
     cz_bess_cap   = custom_bess_mwh * sz_bess_capex
     cz_total_cap  = cz_solar_cap + cz_bess_cap
     cz_solar_kwh  = cz_solar_mw * 1000 * sz_cuf * 8760
-    cz_solar_save = cz_solar_kwh * on_peak_y1  # Zero Export: 100% offset at on-peak rate
+    # Bill Sizer quick estimate: 85% on-peak offset + 15% at 2.2 THB/kWh (v17.3 B43)
+    cz_solar_save = cz_solar_kwh * (0.85 * on_peak_y1 + 0.15 * 2.2)
     cz_spread     = max(on_peak_y1 - off_peak_y1 / rte, 0)
     # v15: 2 cycles only if Solar present (Solar enables Cycle 1), else 1 cycle pure arb
     cz_arb_cycles = 2 if cz_solar_mw > 0 else 1
     cz_bess_save  = custom_bess_mwh * cz_spread * sz_working_days * cz_arb_cycles * 0.70
-    cz_dem_save   = (cz_solar_mw * 1000 * sz_dem_red) * 74.14 * 12 * 0.70
+    cz_dem_save   = (cz_solar_mw * 1000 * sz_dem_red) * sz_demand_rate * 12 * 0.70
     cz_total_save = cz_solar_save + cz_bess_save + cz_dem_save
     cz_pb_no_boi  = cz_total_cap / cz_total_save if cz_total_save > 0 else None
     cz_boi_elig   = min(cz_bess_cap, 12_000_000 * cz_solar_mw)
@@ -1682,6 +1743,8 @@ with tab6:
 ≥3 = Strong | ≥2 = Recommend | ≥1.5 = Optional | <1.5 = Not recommended
 
 **Solar sizing:** MW = (On-Peak×60% ÷ Self-Con%) ÷ (CUF×8760×1000)
+
+**Solar save (Bill Sizer):** kWh × (85% × Peak + 15% × 2.20) — ประมาณการ 85% offset on-peak, 15% export
 
 **BESS sizing:** max(Peak shaving={r['bess_mw_from_peak']:.3f}MW, Solar shift={r['bess_mw_from_solar']:.3f}MW) → round↑0.25
 
@@ -1873,8 +1936,8 @@ with tab7:
     st.caption("นักลงทุนลงทุน CAPEX ปีที่ 0 แล้วรับรายได้ PPA ทุกปี — IRR และ Payback คือตัวชี้วัดหลัก")
 
     ppa_om_annual = ppa_total_capex * ppa_om_pct
-    # Augmentation at Y11: partial BESS capacity restoration ~ 20% of BESS CAPEX
-    ppa_augment_y11 = ppa_bess_mwh * ppa_bess_capex * 0.20
+    # Augmentation at Y11: partial BESS capacity restoration ~ 30% of BESS CAPEX (v17.3: LFP conservative)
+    ppa_augment_y11 = ppa_bess_mwh * ppa_bess_capex * 0.30
 
     ppa_cf_rows = []
     ppa_cfs = [-ppa_total_capex]
